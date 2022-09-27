@@ -35,7 +35,7 @@ capture.captureWrite {
 }
 
 capture.captureRead {
-    withMutable {
+    withMutableFolder {
         back() // go to parent (root) folder
     }
     withFolder {
