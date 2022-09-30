@@ -1,10 +1,8 @@
 syntax = "proto3";
-package fs;
+package fs.proto;
 
 option java_multiple_files = true;
 option java_outer_classname = "FileSystemProto";
-
-import "google/protobuf/struct.proto";
 
 message MD5 {
   uint64 little = 1;
@@ -21,10 +19,4 @@ message File {
 
 message Folder {
   string name = 1;
-  repeated File files = 4;
-  repeated Folder folders = 5;
-}
-
-message FileSystem {
-  Folder root = 1;
 }

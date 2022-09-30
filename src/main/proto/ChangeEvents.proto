@@ -1,0 +1,53 @@
+syntax = "proto3";
+package fs.proto;
+
+option java_multiple_files = true;
+option java_outer_classname = "ChangeEventsProto";
+
+import "FileSystem.proto";
+
+message CreateFile {
+  string path = 1;
+  File file = 2;
+}
+
+message DeleteFile {
+  string path = 1;
+}
+
+message MoveFile {
+  string from = 1;
+  string to = 2;
+}
+
+message CopyFile {
+  string from = 1;
+  string to = 2;
+}
+
+message ModifyFile {
+  string path = 1;
+  bytes data = 2;
+  uint32 begin = 3;
+  uint32 end = 4;
+  uint64 timestamp = 5;
+}
+
+message CreateFolder {
+  string path = 1;
+  Folder folder = 2;
+}
+
+message DeleteFolder {
+  string path = 1;
+}
+
+message MoveFolder {
+  string from = 1;
+  string to = 2;
+}
+
+message CopyFolder {
+  string from = 1;
+  string to = 2;
+}

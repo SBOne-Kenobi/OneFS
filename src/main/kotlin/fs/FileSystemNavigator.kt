@@ -5,65 +5,69 @@ import capturing.ContextProvider
 import capturing.ReadContext
 import capturing.WriteContext
 import capturing.impl.ReadPriorityCapture
-import kotlinx.coroutines.coroutineScope
 
 /**
- * Helper class for navigation in [FileSystem].
+ * Helper class for navigation in file system.
  */
-class FileSystemNavigator(fileSystem: FileSystem) :
+class FileSystemNavigator(val _rootNode: MutableFolderNode) :
     ContextProvider<NavReadContext, NavWriteContext>, WithNavigator
 {
     private val capture = ReadPriorityCapture(this)
 
-    private var _fileSystemBuilder: FileSystem.Builder = fileSystem.toBuilder()
-    private var _currentFolderBuilder: Folder.Builder = _fileSystemBuilder.rootBuilder
-    private var _currentPath = mutableListOf(_currentFolderBuilder)
+    private var _currentFolderNode: MutableFolderNode = _rootNode
+    private var _currentPath = _currentFolderNode.path.mutable()
 
     override suspend fun createReadContext(): NavReadContext =
         object : NavReadContext {
-            override val currentFolder: Folder
-                get() = _currentFolderBuilder.build()
-            override val currentPathString
-                get() = _currentPath.path
+            override val rootFolder: FolderNode by lazy {
+                _rootNode.immutableFolder()
+            }
+            override val currentFolder: FolderNode by lazy {
+                _currentFolderNode.immutableFolder()
+            }
+            override val currentPath: FSPathInterface by lazy {
+                _currentPath.immutable()
+            }
         }
 
     override suspend fun createWriteContext(): NavWriteContext {
-        val readContext = createReadContext()
-        return object : NavWriteContext, NavReadContext by readContext {
-            override val fileSystemBuilder by ::_fileSystemBuilder
-            override val currentFolderBuilder by ::_currentFolderBuilder
+        return object : NavWriteContext {
+            override val rootFolder: MutableFolderNode by ::_rootNode
+            override val currentFolder: MutableFolderNode by ::_currentFolderNode
+            override val currentPath: FSPathInterface by ::_currentPath
 
             override infix fun cd(targetPath: String) {
-                var newFolderBuilder: Folder.Builder
-                val newPath: MutableList<Folder.Builder>
+                var newFolderNode: MutableFolderNode
+                val newPath: MutableFSPath
 
-                var seq = targetPath.toPathSequence()
-                if (targetPath.startsWith('/')) {
-                    newFolderBuilder = fileSystemBuilder.rootBuilder
-                    newPath = mutableListOf(newFolderBuilder)
-                    seq = seq.drop(1)
+                val targetPathOptimized = targetPath.removePrefix(currentPath.path)
+                if (targetPathOptimized.isBlank()) {
+                    return
+                }
+
+                val target = FSPath(targetPathOptimized)
+                if (targetPathOptimized.startsWith('/')) {
+                    newFolderNode = _rootNode
+                    newPath = MutableFSPath()
                 } else {
-                    if (targetPath.startsWith('.')) {
-                        seq = seq.drop(1)
-                    }
-                    newFolderBuilder = _currentFolderBuilder
-                    newPath = _currentPath.toMutableList()
+                    newFolderNode = _currentFolderNode
+                    newPath = _currentPath
                 }
 
-                seq.forEach { nextName ->
-                    newFolderBuilder = newFolderBuilder.foldersBuilderList.firstOrNull {
-                        it.name == nextName
-                    } ?: throw DirectoryNotFound(newPath.path + nextName)
-                    newPath.add(newFolderBuilder)
+                target.pathList.forEach { nextName ->
+                    newFolderNode = newFolderNode.folders
+                        .firstOrNull { it.folder.name == nextName }
+                        ?: throw DirectoryNotFound(newPath.path + nextName)
+                    newPath.add(newFolderNode)
                 }
-                _currentFolderBuilder = newFolderBuilder
+                _currentFolderNode = newFolderNode
                 _currentPath = newPath
             }
 
             override fun back() {
-                if (_currentPath.size > 1) {
+                _currentFolderNode.parent?.let {
+                    _currentFolderNode = it
                     _currentPath.removeLast()
-                    _currentFolderBuilder = _currentPath.last()
                 }
             }
         }
@@ -87,69 +91,40 @@ class FileSystemNavigator(fileSystem: FileSystem) :
 
 }
 
-interface NavReadContext : ReadContext {
+typealias NavContextGeneric = NavContext<FileNodeInterface, FolderNodeInterface>
+
+interface NavContext<out File: FileNodeInterface, out Folder: FolderNodeInterface> {
+    val rootFolder: Folder
     val currentFolder: Folder
-
-    /**
-     * Current absolute path string.
-     */
-    val currentPathString: String
-
-    /**
-     * Get folder with [name].
-     */
-    fun getFolder(name: String): Folder =
-        currentFolder.foldersList.firstOrNull { it.name == name }
-            ?: throw DirectoryNotFound(currentPathString + name)
-
-    /**
-     * Get file with [name].
-     */
-    fun getFile(name: String): File =
-        currentFolder.filesList.firstOrNull { it.name == name }
-            ?: throw FileNotFound(currentPathString + name)
-
-    /**
-     * Apply function [block] recursive. When [block] returns false, recursive calls will be stopped.
-     *
-     * @return true if all invocations returned true
-     */
-    suspend fun applyFunc(recursive: Boolean, block: suspend (FolderWithAbsolutePath) -> Boolean): Boolean = coroutineScope {
-        if (!recursive) {
-            return@coroutineScope block(FolderWithAbsolutePath(currentFolder, currentPathString))
-        }
-        val stack = ArrayList<Pair<FolderWithAbsolutePath, Int>>()
-        stack.add(FolderWithAbsolutePath(currentFolder, currentPathString) to 0)
-        while (stack.isNotEmpty()) {
-            val (folderWithPath, index) = stack.removeLast()
-            if (index < folderWithPath.folder.foldersCount) {
-                stack.add(folderWithPath to index + 1)
-                val nextFolder = folderWithPath.folder.getFolders(index)
-                val nextFolderWithPath = FolderWithAbsolutePath(
-                    nextFolder,
-                    folderWithPath.absolutePath + nextFolder.name + "/"
-                )
-                stack.add(nextFolderWithPath to 0)
-            } else {
-                if (!block(folderWithPath)) {
-                    return@coroutineScope false
-                }
-            }
-        }
-        true
-    }
+    val currentPath: FSPathInterface
 }
 
-interface NavWriteContext : WriteContext, NavReadContext {
-    /**
-     * Mutable [FileSystem].
-     */
-    val fileSystemBuilder: FileSystem.Builder
+/**
+ * Get folder with [name].
+ */
+inline fun <File: FileNodeInterface, reified Folder: FolderNodeInterface> NavContext<File, Folder>.getFolder(
+    name: String
+): Folder = currentFolder.folders
+    .firstOrNull { it.folder.name == name } as Folder?
+    ?: throw DirectoryNotFound(currentPath.path + name)
 
-    /**
-     * Mutable [Folder].
-     */
-    val currentFolderBuilder: Folder.Builder
+/**
+ * Get file with [name].
+ */
+inline fun <reified File: FileNodeInterface, Folder: FolderNodeInterface> NavContext<File, Folder>.getFile(
+    name: String
+): File = currentFolder.files
+    .firstOrNull { it.file.name == name } as File?
+    ?: throw FileNotFound(currentPath.path + name)
+
+interface NavReadContext : ReadContext, NavContext<FileNode, FolderNode> {
+    override val rootFolder: FolderNode
+    override val currentFolder: FolderNode
+}
+
+interface NavWriteContext : WriteContext, NavContext<MutableFileNode, MutableFolderNode> {
+    override val rootFolder: MutableFolderNode
+    override val currentFolder: MutableFolderNode
 
     /**
      * Go to path [targetPath].
@@ -176,13 +151,3 @@ interface WithNavigator: AccessCapture<NavReadContext, NavWriteContext> {
      */
     suspend fun withFolder(block: suspend NavReadContext.() -> Unit) = captureRead(block)
 }
-
-data class FolderWithAbsolutePath(
-    val folder: Folder,
-    val absolutePath: String
-)
-
-data class FileWithAbsolutePath(
-    val file: File,
-    val absolutePath: String
-)
