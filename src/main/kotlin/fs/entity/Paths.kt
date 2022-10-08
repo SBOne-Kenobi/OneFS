@@ -1,4 +1,6 @@
-package fs
+package fs.entity
+
+import fs.toPathSequence
 
 
 sealed interface FSPathInterface {
@@ -28,7 +30,7 @@ val FSPathInterface.name: String
     get() = pathList.lastOrNull() ?: "."
 
 fun FSPathInterface.mutable() = when (this) {
-    is MutableFSPath -> this.copy()
+    is MutableFSPath -> this.copy(pathList = pathList.toMutableList())
     is FSPath -> MutableFSPath(path, pathList.toMutableList())
 }
 
@@ -39,8 +41,8 @@ fun FSPathInterface.immutable() = when (this) {
 
 fun MutableFSPath.add(node: FSNodeInterface): MutableFSPath {
     val (name, postfix) = when (node) {
-        is FileNodeInterface -> node.file.name to ""
-        is FolderNodeInterface -> node.folder.name to "/"
+        is FileNodeInterface -> node.fileName to ""
+        is FolderNodeInterface -> node.folderName to "/"
     }
     path += (name + postfix)
     pathList.add(name)

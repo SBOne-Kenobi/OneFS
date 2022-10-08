@@ -1,12 +1,14 @@
 package fs
 
-import com.google.protobuf.ByteString
-import fs.proto.File
-import fs.proto.Folder
+import fs.entity.MutableDataCell
+import fs.entity.MutableFileNode
+import fs.entity.MutableFolderNode
+import fs.interactor.InteractorInterface
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.BasicFileAttributes
 import kotlin.io.path.forEachDirectoryEntry
+import kotlin.io.path.inputStream
 import kotlin.io.path.isDirectory
 import kotlin.io.path.name
 
@@ -14,37 +16,43 @@ import kotlin.io.path.name
  * Interface for importing data from external sources.
  */
 interface Importer<FileId, FolderId> {
-    fun importFile(fileId: FileId): MutableFileNode
-    fun importFolder(folderId: FolderId): MutableFolderNode
+    fun importFile(interactor: InteractorInterface, parent: MutableFolderNode, fileId: FileId): MutableFileNode
+    fun importFolder(interactor: InteractorInterface, parent: MutableFolderNode, folderId: FolderId): MutableFolderNode
 }
 
 class SystemImporter : Importer<Path, Path> {
-    override fun importFile(fileId: Path): MutableFileNode {
-        val file = File.newBuilder().apply {
-            val file = fileId.toFile()
-            val content = file.readBytes()
-            name = file.name
-            data = ByteString.copyFrom(content)
-            md5 = content.computeMD5()
-            val attrs = Files.readAttributes(fileId, BasicFileAttributes::class.java)
-            creationTimestamp = attrs.creationTime().toMillis()
-            modificationTimestamp = attrs.lastModifiedTime().toMillis()
+    override fun importFile(interactor: InteractorInterface, parent: MutableFolderNode, fileId: Path): MutableFileNode {
+        val attrs = Files.readAttributes(fileId, BasicFileAttributes::class.java)
+
+        val dataCell = MutableDataCell(interactor.allocateNewData(Files.size(fileId)))
+        dataCell.getOutputStream(0).use { output ->
+            fileId.inputStream().use { input ->
+                input.copyTo(output)
+            }
         }
-        return MutableFileNode(file)
+
+        return MutableFileNode(
+            fileId.name,
+            dataCell,
+            attrs.creationTime().toMillis(),
+            attrs.lastModifiedTime().toMillis(),
+            fileId.inputStream().computeMD5(),
+            parent
+        ).also {
+            interactor.createFile(it)
+        }
     }
 
-    override fun importFolder(folderId: Path): MutableFolderNode {
-        val folder = Folder.newBuilder().apply {
-            name = folderId.name
-        }
-        val result = MutableFolderNode(folder)
-        folderId.forEachDirectoryEntry { path ->
-            val child = if (path.isDirectory()) {
-                importFolder(path).also {
+    override fun importFolder(interactor: InteractorInterface, parent: MutableFolderNode, folderId: Path): MutableFolderNode {
+        val result = MutableFolderNode(folderId.name, parent = parent)
+        interactor.createFolder(result)
+        folderId.forEachDirectoryEntry { pathId ->
+            val child = if (pathId.isDirectory()) {
+                importFolder(interactor, result, pathId).also {
                     result.folders.add(it)
                 }
             } else {
-                importFile(path).also {
+                importFile(interactor, result, pathId).also {
                     result.files.add(it)
                 }
             }

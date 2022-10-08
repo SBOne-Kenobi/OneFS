@@ -1,277 +1,350 @@
 package fs.interactor
 
-import capturing.impl.ReadPriorityCapture
-import com.google.protobuf.ByteString
-import com.google.protobuf.Message
-import fs.FileNodeInterface
-import fs.FileSystemWriteContext
-import fs.FolderNodeInterface
-import fs.MutableFolderNode
-import fs.NavWriteContext
-import fs.OneFileSystemException
-import fs.OneFileSystemProvider
-import fs.build
-import fs.excludeLast
-import fs.lastName
-import fs.proto.CopyFile
-import fs.proto.CopyFolder
-import fs.proto.CreateFile
-import fs.proto.CreateFolder
-import fs.proto.DeleteFile
-import fs.proto.DeleteFolder
-import fs.proto.FileOrBuilder
-import fs.proto.Folder
-import fs.proto.FolderOrBuilder
-import fs.proto.ModifyFile
-import fs.proto.MoveFile
-import fs.proto.MoveFolder
-import fs.toByteArray
-import fs.toInt
+import fs.entity.DataCellController
+import fs.entity.DataPointer
+import fs.entity.DataPointerObserver
+import fs.entity.FileRecord
+import fs.entity.FolderRecord
+import fs.entity.FreeRecord
+import fs.entity.HEADER_SIZE
+import fs.entity.ITEM_POINTER_SIZE
+import fs.entity.ItemPointer
+import fs.entity.ItemRecord
+import fs.entity.LONG_SIZE
+import fs.entity.MAX_NAME_SIZE
+import fs.entity.MutableDataCell
+import fs.entity.MutableFSNode
+import fs.entity.MutableFileNode
+import fs.entity.MutableFolderNode
+import fs.entity.OneFileSystemException
+import fs.entity.RowUsedContentRecord
+import fs.entity.parseNextRecord
+import fs.entity.writeRecord
+import fs.toMemoryArea
 import java.io.InputStream
+import java.io.OutputStream
+import java.io.RandomAccessFile
 import java.nio.file.Path
-import java.nio.file.StandardOpenOption
 import kotlin.io.path.createFile
 import kotlin.io.path.inputStream
 import kotlin.io.path.isDirectory
 import kotlin.io.path.notExists
 import kotlin.io.path.outputStream
-import kotlin.io.path.writeBytes
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
+import kotlin.properties.Delegates
+import kotlin.reflect.jvm.isAccessible
+import org.apache.commons.io.input.BoundedInputStream
+import org.apache.commons.io.input.RandomAccessFileInputStream
+import utils.RandomAccessFileOutputStream
 
 /**
  * Interactor for working with filesystem's file.
  */
-class FSInteractor(val fileSystemPath: Path) : InteractorInterface, AutoCloseable {
+class FSInteractor(val fileSystemPath: Path, private val allocator: Allocator) : InteractorInterface, AutoCloseable {
 
     init {
         if (fileSystemPath.notExists()) {
             fileSystemPath.createFile()
+            fileSystemPath.outputStream().use {
+                writeRecord(
+                    it, FolderRecord(
+                        name = "",
+                        ItemPointer(beginPosition = -1),
+                        beginRecordPosition = 0
+                    )
+                )
+            }
         } else if (fileSystemPath.isDirectory()) {
             throw OneFileSystemException("$fileSystemPath is a directory!")
         }
     }
 
-    private data class MessageRecord(val id: Int, val message: Message)
-    private var stream = fileSystemPath.outputStream(StandardOpenOption.APPEND)
+    private fun getRAF() = RandomAccessFile(fileSystemPath.toFile(), "rw")
 
-    private fun writeMessage(message: MessageRecord) {
-        // id + size of message + message bytes
-        stream.write(message.id.toByteArray())
-        val bytes = message.message.toByteArray()
-        stream.write(bytes.size.toByteArray())
-        stream.write(bytes)
-        stream.flush()
-    }
+    private inner class FileDataCellController(private val recordPosition: Long) : DataCellController {
 
-    private fun readNextCommand(input: InputStream): Message? {
-        val command = ByteArray(Int.SIZE_BYTES)
-        if (input.read(command) != command.size) {
-            return null
-        }
-        val sizeBytes = ByteArray(Int.SIZE_BYTES)
-        if (input.read(sizeBytes) != sizeBytes.size) {
-            return null
-        }
-        val messageBytes = ByteArray(sizeBytes.toInt())
-        if (input.read(messageBytes) != messageBytes.size) {
-            return null
-        }
-        return when (command.toInt()) {
-            1 -> CreateFile.parseFrom(messageBytes)
-            2 -> DeleteFile.parseFrom(messageBytes)
-            3 -> MoveFile.parseFrom(messageBytes)
-            4 -> CopyFile.parseFrom(messageBytes)
-            5 -> ModifyFile.parseFrom(messageBytes)
-            6 -> CreateFolder.parseFrom(messageBytes)
-            7 -> DeleteFolder.parseFrom(messageBytes)
-            8 -> MoveFolder.parseFrom(messageBytes)
-            9 -> CopyFolder.parseFrom(messageBytes)
-            else -> null
-        }
-    }
+        var fileRecordPosition by Delegates.notNull<Long>()
 
-    private fun NavWriteContext.callCommand(message: Message, writeContext: FileSystemWriteContext) {
-        writeContext.run {
-            when (message) {
-                is CreateFile -> {
-                    cd(message.path.excludeLast())
-                    createFile(message.file)
+        private inner class LengthUpdater : DataPointerObserver {
+            private val raf = getRAF()
+            private val position = recordPosition + HEADER_SIZE
+
+            override fun lengthOnChange(newValue: Long) {
+                raf.seek(position)
+                raf.writeLong(newValue)
+            }
+
+            override fun close() {
+                raf.close()
+            }
+
+        }
+
+        override val dataPointer: DataPointer by lazy {
+            val raf = getRAF()
+            raf.seek(recordPosition)
+            val inputStream = RandomAccessFileInputStream(raf)
+            val record = parseNextRecord(inputStream, recordPosition) as RowUsedContentRecord
+            inputStream.close()
+            raf.close()
+
+            DataPointer(
+                record.beginRecordPosition + EXTENDED_DATA_HEADER_SIZE,
+                record.filledSize,
+                record.capacitySize,
+                LengthUpdater()
+            )
+        }
+
+        override fun getInputStream(): InputStream {
+            val raf = getRAF()
+            raf.seek(dataPointer.beginPosition)
+            return RandomAccessFileInputStream(raf, true)
+        }
+
+        override fun getOutputStream(offset: Long): OutputStream {
+            val raf = getRAF()
+            raf.seek(dataPointer.beginPosition + offset)
+            return RandomAccessFileOutputStream(raf, closeOnClose = true)
+        }
+
+        override fun allocateNew(newMinimalSize: Long): DataCellController {
+            return allocateNewData(newMinimalSize).also {
+                // change pointer in file record
+                it as FileDataCellController
+                it.fileRecordPosition = fileRecordPosition
+                val raf = getRAF()
+                raf.seek(fileRecordPosition + HEADER_SIZE + MAX_NAME_SIZE + ITEM_POINTER_SIZE)
+                raf.writeLong(it.recordPosition)
+                raf.close()
+            }
+        }
+
+        override fun free() {
+            makeRecordFree(recordPosition)
+            close()
+        }
+
+        /**
+         * Don't use [allocateNew] without register and connection new data with any file.
+         */
+        override fun createDeepCopy(): DataCellController {
+            val newController = allocateNewData(dataPointer.dataLength)
+            BoundedInputStream(getInputStream(), dataPointer.dataLength).use { input ->
+                newController.getOutputStream(0).use { output ->
+                    input.copyTo(output)
                 }
-                is DeleteFile -> {
-                    cd(message.path.excludeLast())
-                    deleteFile(message.path.lastName())
-                }
-                is MoveFile -> {
-                    cd(message.from.excludeLast())
-                    moveFile(message.from.lastName(), message.to, override = true)
-                }
-                is CopyFile -> {
-                    cd(message.from.excludeLast())
-                    copyFile(message.from.lastName(), message.to, override = true)
-                }
-                is ModifyFile -> {
-                    cd(message.path.excludeLast())
-                    writeIntoFile(message.path.lastName(), message.data.toByteArray(), message.begin, message.end)
-                }
-                is CreateFolder -> {
-                    cd(message.path.excludeLast())
-                    createFolder(message.folder.name)
-                }
-                is DeleteFolder -> {
-                    cd(message.path.excludeLast())
-                    deleteFolder(message.path.lastName())
-                }
-                is MoveFolder -> {
-                    cd(message.from.excludeLast())
-                    moveFolder(message.from.lastName(), message.to, override = true)
-                }
-                is CopyFolder -> {
-                    cd(message.from.excludeLast())
-                    copyFolder(message.from.lastName(), message.to, override = true)
+            }
+            newController.dataPointer.dataLength = dataPointer.dataLength
+            return newController
+        }
+
+        override fun close() {
+            val field = this::dataPointer
+            field.isAccessible = true
+            field.getDelegate().apply {
+                this as Lazy<*>
+                if (isInitialized()) {
+                    dataPointer.close()
                 }
             }
         }
+
     }
+
+    private fun getDataCell(filePosition: Long, beginPosition: Long): MutableDataCell {
+        val dataCellController = FileDataCellController(beginPosition)
+        dataCellController.fileRecordPosition = filePosition
+        return MutableDataCell(dataCellController)
+    }
+
+    private val positionToNode: MutableMap<Long, MutableFSNode> = mutableMapOf()
+    private val nodeToPosition: MutableMap<MutableFSNode, Long> = mutableMapOf()
+
+    private fun registerNewNodeWithPosition(node: MutableFSNode, position: Long) {
+        positionToNode[position] = node
+        nodeToPosition[node] = position
+    }
+
+    private fun unregisterNode(node: MutableFSNode) {
+        val position = nodeToPosition[node]
+        nodeToPosition.remove(node)
+        positionToNode.remove(position)
+    }
+
+    private fun MutableFSNode?.toPointer(): ItemPointer = if (this == null) {
+        ItemPointer(beginPosition = -1)
+    } else {
+        ItemPointer(nodeToPosition[this]!!)
+    }
+
+    private fun registerRecord(record: ItemRecord, initChain: MutableList<() -> Unit>): MutableFolderNode? =
+        when (record) {
+            is FileRecord -> {
+                val fileNode = MutableFileNode(
+                    record.name,
+                    getDataCell(record.beginRecordPosition, record.contentPointer.beginPosition),
+                    record.creationTimestamp,
+                    record.modificationTimestamp,
+                    record.md5
+                )
+                initChain.add {
+                    fileNode.parent = positionToNode[record.parentPointer.beginPosition] as MutableFolderNode?
+                    fileNode.parent?.files?.add(fileNode)
+                }
+                registerNewNodeWithPosition(fileNode, record.beginRecordPosition)
+                allocator.registerUsedArea(record.toMemoryArea())
+                null
+            }
+
+            is FolderRecord -> {
+                val folderNode = MutableFolderNode(record.name)
+                initChain.add {
+                    folderNode.parent = positionToNode[record.parentPointer.beginPosition] as MutableFolderNode?
+                    folderNode.parent?.folders?.add(folderNode)
+                }
+                registerNewNodeWithPosition(folderNode, record.beginRecordPosition)
+                allocator.registerUsedArea(record.toMemoryArea())
+                folderNode.takeIf { record.parentPointer.beginPosition == -1L }
+            }
+
+            is FreeRecord -> {
+                allocator.registerFreeArea(record.toMemoryArea())
+                null
+            }
+
+            is RowUsedContentRecord -> {
+                allocator.registerUsedArea(record.toMemoryArea())
+                null
+            }
+        }
 
     override fun getFileSystem(): MutableFolderNode {
+        allocator.clear()
+        nodeToPosition.clear()
+        positionToNode.clear()
+
+        var rootNode: MutableFolderNode? = null
+        val initChain = mutableListOf<() -> Unit>()
+
         val input = fileSystemPath.inputStream()
-        val fakeInteractor = FakeInteractor()
-        val provider = OneFileSystemProvider(fakeInteractor)
-        val capture = ReadPriorityCapture(provider)
-        var result = MutableFolderNode(Folder.newBuilder().apply { name = "" })
-        runBlocking {
-            capture.captureWrite {
-                val writeContext = this
-                captureWrite {
-                    while (true) {
-                        val message = readNextCommand(input) ?: break
-                        callCommand(message, writeContext)
-                    }
-                    result = rootFolder
-                }
+        var currentPosition = 0L
+        while (true) {
+            val record = parseNextRecord(input, currentPosition) ?: break
+            currentPosition += record.recordSize
+            registerRecord(record, initChain)?.let {
+                rootNode = it
             }
         }
-        return result
+        initChain.forEach { it() }
+
+        return rootNode ?: throw OneFileSystemException("Root not found!")
     }
 
-    private fun NavWriteContext.overrideFolder(
-        folderNode: FolderNodeInterface,
-        writeContext: FileSystemWriteContext
-    ) {
-        writeContext.run {
-            folderNode.files.forEach { overrideFile(it, writeContext) }
-            folderNode.folders.forEach {
-                createFolder(it.folder.name)
-                cd(it.folder.name)
-                overrideFolder(it, writeContext)
-                back()
-            }
+    companion object {
+        private const val EXTENDED_DATA_HEADER_SIZE = HEADER_SIZE + LONG_SIZE + LONG_SIZE
+    }
+
+    private fun writeRecord(record: ItemRecord) {
+        val raf = getRAF()
+        raf.seek(record.beginRecordPosition)
+        RandomAccessFileOutputStream(raf, closeOnClose = true).use {
+            writeRecord(it, record)
         }
     }
 
-    private fun NavWriteContext.overrideFile(
-        fileNode: FileNodeInterface,
-        writeContext: FileSystemWriteContext
-    ) {
-        writeContext.run {
-            createFile(fileNode.file.build())
+    override fun allocateNewData(minimalSize: Long): DataCellController {
+        val area = allocator.allocateNewData(EXTENDED_DATA_HEADER_SIZE + minimalSize)
+
+        val record = RowUsedContentRecord(
+            filledSize = 0,
+            area.size - EXTENDED_DATA_HEADER_SIZE,
+            area.begin
+        )
+        writeRecord(record)
+
+        return FileDataCellController(area.begin)
+    }
+
+    private fun makeRecordFree(position: Long) {
+        val raf = getRAF()
+        raf.seek(position)
+        // mark data free
+        raf.write(0)
+        raf.close()
+
+        val area = allocator.unregisterUsedArea(position)
+        allocator.registerFreeArea(area)
+    }
+
+    private fun MutableFileNode.toFileRecord(beginPosition: Long) = FileRecord(
+        fileName,
+        parent.toPointer(),
+        ItemPointer(dataCell.controller.dataPointer.beginPosition - EXTENDED_DATA_HEADER_SIZE),
+        creationTimestamp,
+        modificationTimestamp,
+        md5,
+        beginPosition
+    )
+
+    private fun MutableFolderNode.toFolderRecord(beginPosition: Long) = FolderRecord(
+        folderName,
+        parent.toPointer(),
+        beginPosition
+    )
+
+    override fun createFile(file: MutableFileNode) {
+        val area = allocator.allocateNewData(HEADER_SIZE + FileRecord.DATA_SIZE.toLong(), fitted = true)
+
+        val record = file.toFileRecord(area.begin)
+        writeRecord(record)
+
+        registerNewNodeWithPosition(file, area.begin)
+    }
+
+    override fun deleteFile(file: MutableFileNode) {
+        val position = nodeToPosition[file]!!
+        makeRecordFree(position)
+        unregisterNode(file)
+    }
+
+    override fun updateFileRecord(file: MutableFileNode) {
+        val position = nodeToPosition[file]!!
+        val record = file.toFileRecord(position)
+        writeRecord(record)
+    }
+
+    override fun createFolder(folder: MutableFolderNode) {
+        val area = allocator.allocateNewData(HEADER_SIZE + FolderRecord.DATA_SIZE.toLong(), fitted = true)
+
+        val record = folder.toFolderRecord(area.begin)
+        writeRecord(record)
+        registerNewNodeWithPosition(folder, area.begin)
+    }
+
+    override fun deleteFolder(folder: MutableFolderNode) {
+        val position = nodeToPosition[folder]!!
+        makeRecordFree(position)
+        unregisterNode(folder)
+        folder.files.forEach {
+            deleteFile(it)
+        }
+        folder.folders.forEach {
+            deleteFolder(it)
         }
     }
 
-    override suspend fun overrideFileWith(rootNode: FolderNodeInterface) {
-        withContext(Dispatchers.IO) {
-            stream.close()
-        }
-        fileSystemPath.writeBytes(ByteArray(0))
-        stream = fileSystemPath.outputStream(StandardOpenOption.APPEND)
-
-        val provider = OneFileSystemProvider(this)
-        val capture = ReadPriorityCapture(provider)
-        capture.captureWrite {
-            val writeContext = this
-            withMutableFolder {
-                overrideFolder(rootNode, writeContext)
-            }
-        }
-    }
-
-    override fun createFile(path: String, file: FileOrBuilder) {
-        val message = CreateFile.newBuilder().apply {
-            this.path = path
-            this.file = file.build()
-        }.build()
-        writeMessage(MessageRecord(1, message))
-    }
-
-    override fun deleteFile(path: String) {
-        val message = DeleteFile.newBuilder().apply {
-            this.path = path
-        }.build()
-        writeMessage(MessageRecord(2, message))
-    }
-
-    override fun moveFile(from: String, to: String) {
-        val message = MoveFile.newBuilder().apply {
-            this.from = from
-            this.to = to
-        }.build()
-        writeMessage(MessageRecord(3, message))
-    }
-
-    override fun copyFile(from: String, to: String) {
-        val message = CopyFile.newBuilder().apply {
-            this.from = from
-            this.to = to
-        }.build()
-        writeMessage(MessageRecord(4, message))
-    }
-
-    override fun modifyFile(path: String, data: ByteArray, begin: Int, end: Int, timestamp: Long) {
-        val message = ModifyFile.newBuilder().apply {
-            this.path = path
-            this.data = ByteString.copyFrom(data)
-            this.begin = begin
-            this.end = end
-            this.timestamp = timestamp
-        }.build()
-        writeMessage(MessageRecord(5, message))
-    }
-
-    override fun createFolder(path: String, folder: FolderOrBuilder) {
-        val message = CreateFolder.newBuilder().apply {
-            this.path = path
-            this.folder = folder.build()
-        }.build()
-        writeMessage(MessageRecord(6, message))
-    }
-
-    override fun deleteFolder(path: String) {
-        val message = DeleteFolder.newBuilder().apply {
-            this.path = path
-        }.build()
-        writeMessage(MessageRecord(7, message))
-    }
-
-    override fun moveFolder(from: String, to: String) {
-        val message = MoveFolder.newBuilder().apply {
-            this.from = from
-            this.to = to
-        }.build()
-        writeMessage(MessageRecord(8, message))
-    }
-
-    override fun copyFolder(from: String, to: String) {
-        val message = CopyFolder.newBuilder().apply {
-            this.from = from
-            this.to = to
-        }.build()
-        writeMessage(MessageRecord(9, message))
+    override fun updateFolderRecord(folder: MutableFolderNode) {
+        val position = nodeToPosition[folder]!!
+        val record = folder.toFolderRecord(position)
+        writeRecord(record)
     }
 
     override fun close() {
-        stream.close()
+        nodeToPosition.keys.forEach {
+            if (it is MutableFileNode) {
+                it.dataCell.controller.close()
+            }
+        }
     }
 
 }

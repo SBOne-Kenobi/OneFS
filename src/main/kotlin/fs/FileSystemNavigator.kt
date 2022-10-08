@@ -5,6 +5,23 @@ import capturing.ContextProvider
 import capturing.ReadContext
 import capturing.WriteContext
 import capturing.impl.ReadPriorityCapture
+import fs.entity.DirectoryNotFound
+import fs.entity.FSPath
+import fs.entity.FSPathInterface
+import fs.entity.FileNode
+import fs.entity.FileNodeInterface
+import fs.entity.FileNotFound
+import fs.entity.FolderNode
+import fs.entity.FolderNodeInterface
+import fs.entity.MutableFSPath
+import fs.entity.MutableFileNode
+import fs.entity.MutableFolderNode
+import fs.entity.add
+import fs.entity.immutable
+import fs.entity.immutableFolder
+import fs.entity.mutable
+import fs.entity.path
+import fs.entity.removeLast
 
 /**
  * Helper class for navigation in file system.
@@ -56,7 +73,7 @@ class FileSystemNavigator(val _rootNode: MutableFolderNode) :
 
                 target.pathList.forEach { nextName ->
                     newFolderNode = newFolderNode.folders
-                        .firstOrNull { it.folder.name == nextName }
+                        .firstOrNull { it.folderName == nextName }
                         ?: throw DirectoryNotFound(newPath.path + nextName)
                     newPath.add(newFolderNode)
                 }
@@ -105,7 +122,7 @@ interface NavContext<out File: FileNodeInterface, out Folder: FolderNodeInterfac
 inline fun <File: FileNodeInterface, reified Folder: FolderNodeInterface> NavContext<File, Folder>.getFolder(
     name: String
 ): Folder = currentFolder.folders
-    .firstOrNull { it.folder.name == name } as Folder?
+    .firstOrNull { it.folderName == name } as Folder?
     ?: throw DirectoryNotFound(currentPath.path + name)
 
 /**
@@ -114,7 +131,7 @@ inline fun <File: FileNodeInterface, reified Folder: FolderNodeInterface> NavCon
 inline fun <reified File: FileNodeInterface, Folder: FolderNodeInterface> NavContext<File, Folder>.getFile(
     name: String
 ): File = currentFolder.files
-    .firstOrNull { it.file.name == name } as File?
+    .firstOrNull { it.fileName == name } as File?
     ?: throw FileNotFound(currentPath.path + name)
 
 interface NavReadContext : ReadContext, NavContext<FileNode, FolderNode> {

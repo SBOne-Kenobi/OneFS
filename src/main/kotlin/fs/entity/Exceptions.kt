@@ -1,6 +1,4 @@
-package fs
-
-import java.lang.Exception
+package fs.entity
 
 open class OneFileSystemException(message: String? = null, cause: Throwable? = null) : Exception(message, cause)
 

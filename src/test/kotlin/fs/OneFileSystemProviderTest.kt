@@ -1,22 +1,20 @@
 package fs
 
 import capturing.impl.ReadPriorityCapture
-import com.google.protobuf.ByteString
+import fs.entity.DirectoryAlreadyExists
+import fs.entity.DirectoryNotFound
 import fs.interactor.FSInteractor
 import fs.interactor.InteractorInterface
-import fs.proto.File
-import fs.proto.Folder
+import fs.interactor.SimpleAllocator
+import java.io.RandomAccessFile
 import kotlin.io.path.Path
-import kotlin.io.path.deleteExisting
 import kotlin.io.path.div
-import kotlin.io.path.fileSize
 import kotlin.io.path.toPath
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Test
 
@@ -24,13 +22,12 @@ class OneFileSystemProviderTest {
 
     private inline fun withTestFS(block: (InteractorInterface) -> Unit) {
         try {
-            val interactor = FSInteractor(fsPath)
-            runBlocking {
-                interactor.overrideFileWith(testRoot)
-            }
+            fsBuilder.build(fsPath)
+            val allocator = SimpleAllocator()
+            val interactor = FSInteractor(fsPath, allocator)
             block(interactor)
         } finally {
-            fsPath.deleteExisting()
+            fsPath.toFile().delete()
         }
     }
 
@@ -109,18 +106,18 @@ class OneFileSystemProviderTest {
 
             capture.captureRead {
                 withFolder {
-                    val foundFiles = findFiles("*").map { it.node.file.name }.toList().sorted()
+                    val foundFiles = findFiles("*").map { it.node.fileName }.toList().sorted()
                     val expectedFiles =
                         listOf("empty.txt", "file", "file_inner.txt", "strangeF!LE", "empty_file").sorted()
                     assertContentEquals(expectedFiles, foundFiles)
                 }
                 withFolder {
-                    val foundFiles = findFiles("**/*.txt").map { it.node.file.name }.toList().sorted()
+                    val foundFiles = findFiles("**/*.txt").map { it.node.fileName }.toList().sorted()
                     val expectedFiles = listOf("empty.txt", "file_inner.txt").sorted()
                     assertContentEquals(expectedFiles, foundFiles)
                 }
                 withFolder {
-                    val foundFiles = findFiles("*", recursive = false).map { it.node.file.name }.toList().sorted()
+                    val foundFiles = findFiles("*", recursive = false).map { it.node.fileName }.toList().sorted()
                     val expectedFiles = listOf("empty.txt", "file").sorted()
                     assertContentEquals(expectedFiles, foundFiles)
                 }
@@ -159,35 +156,11 @@ class OneFileSystemProviderTest {
                 }
                 withMutableFolder {
                     cd("folder")
-                    val lines = readFile("strangeF!LE").decodeToString().lines()
+                    val lines = inputStream("strangeF!LE").readBytes().decodeToString().lines()
                     val expectedLines = listOf(
                         "", "\ts", "t\tr", "\ta", "g\t\t\te", "", "", "\t"
                     )
                     assertEquals(expectedLines, lines)
-                }
-            }
-        }
-    }
-
-    @Test
-    fun testValidate() = runTest {
-        withTestFS { interactor ->
-            val provider = OneFileSystemProvider(interactor)
-            val capture = ReadPriorityCapture(provider)
-
-            capture.captureRead {
-                withFolder {
-                    assert(validate())
-                }
-                withMutableFolder {
-                    cd("folder/folder_2")
-                    currentFolder.files.first().apply {
-                        file.data = ByteString.copyFromUtf8("Unexpected text")
-                    }
-                    cd("/")
-                }
-                withFolder {
-                    assertFalse(validate())
                 }
             }
         }
@@ -232,6 +205,7 @@ class OneFileSystemProviderTest {
                     deleteFile("empty.txt")
                 }
                 withFolder {
+                    println(findFiles("**/empty.txt", recursive = false).toList().map { it.path.path })
                     assert(findFiles("**/empty.txt", recursive = false).toList().isEmpty())
                 }
                 withMutableFolder {
@@ -298,8 +272,8 @@ class OneFileSystemProviderTest {
             val fileSystem = interactor.getFileSystem()
             assertEquals(1, fileSystem.files.size)
             assertEquals(2, fileSystem.folders.size)
-            assertEquals(0, fileSystem.folders.first { it.folder.name == "empty_folder_2" }.files.size)
-            assertEquals(2, fileSystem.folders.first { it.folder.name == "renamed_folder" }.folders.size)
+            assertEquals(0, fileSystem.folders.first { it.folderName == "empty_folder_2" }.files.size)
+            assertEquals(2, fileSystem.folders.first { it.folderName == "renamed_folder" }.folders.size)
         }
     }
 
@@ -351,8 +325,8 @@ class OneFileSystemProviderTest {
             val fileSystem = interactor.getFileSystem()
             assertEquals(3, fileSystem.files.size)
             assertEquals(2, fileSystem.folders.size)
-            assertEquals(0, fileSystem.folders.first { it.folder.name == "empty_folder" }.files.size)
-            assertEquals(3, fileSystem.folders.first { it.folder.name == "folder" }.folders.size)
+            assertEquals(0, fileSystem.folders.first { it.folderName == "empty_folder" }.files.size)
+            assertEquals(3, fileSystem.folders.first { it.folderName == "folder" }.folders.size)
         }
     }
 
@@ -364,33 +338,53 @@ class OneFileSystemProviderTest {
 
             capture.captureWrite {
                 withMutableFolder {
-                    writeIntoFile("empty.txt", "Some text".toByteArray())
+                    outputStream("empty.txt").use {
+                        it.write("Some text".encodeToByteArray())
+                    }
                     appendIntoFile("file", "\nJust appended text".toByteArray())
                 }
                 withFolder {
                     assertEquals("Some text", readFile("empty.txt").decodeToString())
                     assertEquals("This is file!\nJust appended text", readFile("file").decodeToString())
+                    assertFalse(validate())
+                }
+                withMutableFolder {
+                    updateMD5("file")
+                    updateMD5("empty.txt")
                     assert(validate())
                 }
                 withMutableFolder {
-                    writeIntoFile("file", "not ".toByteArray(), begin = 8, end = 8)
-                    writeIntoFile("file", ByteArray(0), begin = 17)
+                    clearFile("file")
+                    outputStream("file").use {
+                        it.write("This is file.".encodeToByteArray())
+                    }
+                    outputStream("file", offset = 8).use {
+                        it.write("FILE".encodeToByteArray())
+                    }
+                    updateMD5("file")
                     assert(validate())
                 }
                 withFolder {
-                    assertEquals("This is not file!", readFile("file").decodeToString())
+                    assertEquals("This is FILE.", readFile("file").decodeToString())
                 }
             }
 
             val fileSystem = interactor.getFileSystem()
+            val raf = RandomAccessFile(fsPath.toFile(), "r")
+
             fileSystem.files.forEach {
-                if (it.file.name == "file") {
-                    assertEquals("This is not file!", it.file.data.toStringUtf8())
-                } else if (it.file.name == "empty.txt") {
-                    assertEquals("Some text", it.file.data.toStringUtf8())
+                val pointer = it.dataCell.controller.dataPointer
+                raf.seek(pointer.beginPosition)
+                val content = ByteArray(pointer.dataLength.toInt())
+                raf.readFully(content)
+                if (it.fileName == "file") {
+                    assertEquals("This is FILE.", content.decodeToString())
+                } else if (it.fileName == "empty.txt") {
+                    assertEquals("Some text", content.decodeToString())
                 }
             }
 
+            raf.close()
         }
     }
 
@@ -404,15 +398,11 @@ class OneFileSystemProviderTest {
 
             capture.captureWrite {
                 withMutableFolder {
-                    importFile("imported_file") {
-                        importer.importFile(testDirPath / "testFile.txt")
-                    }
+                    importFile("./", importer, testDirPath / "testFile.txt")
                     assertEquals(3, currentFolder.files.size)
-                    assertEquals("Hello, that's a test file!", readFile("imported_file").decodeToString())
+                    assertEquals("Hello, that's a test file!", readFile("testFile.txt").decodeToString())
 
-                    importDirectory("./") {
-                        importer.importFolder(testDirPath)
-                    }
+                    importDirectory("./", importer, testDirPath)
                     assertEquals(3, currentFolder.folders.size)
 
                     cd("testDir")
@@ -425,86 +415,60 @@ class OneFileSystemProviderTest {
                         listOf("Inner file", "Ho-ho-ho", "end."),
                         readFile("innerFile").decodeToString().lines()
                     )
+                    assert(validate())
                 }
             }
 
             val fileSystem = interactor.getFileSystem()
             assertEquals(3, fileSystem.files.size)
             assertEquals(3, fileSystem.folders.size)
-            assertEquals(1, fileSystem.folders.first { it.folder.name == "testDir" }.files.size)
+            assertEquals(1, fileSystem.folders.first { it.folderName == "testDir" }.files.size)
 
-        }
-    }
-
-    @Test
-    fun testOverride() = runTest {
-        withTestFS { interactor ->
-            val resultString = "Hello, This is file!"
-
-            val provider = OneFileSystemProvider(interactor)
-            val capture = ReadPriorityCapture(provider)
-
-            capture.captureWrite {
-                withMutableFolder {
-                    writeIntoFile("file", "Hello, ".toByteArray(), begin = 0, end = 0)
-                    assertEquals(resultString, readFile("file").decodeToString())
-                }
-            }
-
-            val sizeWithoutOptimize = fsPath.fileSize()
-
-            capture.captureWrite {
-                withMutableFolder {
-                    optimize()
-                    assertEquals(resultString, readFile("file").decodeToString())
-                }
-            }
-
-            val sizeWithOptimize = fsPath.fileSize()
-            assert(sizeWithOptimize < sizeWithoutOptimize)
-
-            val fileSystem = interactor.getFileSystem()
-            assertEquals(resultString, fileSystem.files.first { it.file.name == "file" }.file.data.toStringUtf8())
         }
     }
 
     companion object {
         val fsPath = Path(System.getProperty("java.io.tmpdir"), "testOneFS")
 
-        private fun MutableFolderNode.addFiles(vararg files: Pair<String, String>) {
-            this.files.addAll(files.map { (name, data) ->
-                MutableFileNode(File.newBuilder().apply {
-                    this.name = name
-                    this.data = ByteString.copyFromUtf8(data)
-                    this.md5 = this.data.toByteArray().computeMD5()
-                }, parent = this)
+        private fun FolderBuilder.addFiles(vararg files: Pair<String, String>) {
+            fileBuilders.addAll(files.map { (name, data) ->
+                FileBuilder().apply {
+                    this.fileName = name
+                    this.data = data.encodeToByteArray()
+                    this.md5 = this.data.computeMD5()
+                }
             })
         }
 
-        private fun MutableFolderNode.addFolder(name: String, init: MutableFolderNode.() -> Unit = {}) {
-            this.folders.add(
-                MutableFolderNode(Folder.newBuilder().apply { this.name = name }, parent = this).apply(init)
+        private fun FolderBuilder.addFolder(name: String, init: FolderBuilder.() -> Unit = {}) {
+            folderBuilders.add(
+                FolderBuilder().apply {
+                    this.folderName = name
+                    init()
+                }
             )
         }
 
-        val testRoot = MutableFolderNode(Folder.newBuilder().apply { name = "" }).apply {
-            addFiles(
-                "empty.txt" to "",
-                "file" to "This is file!",
-            )
-            addFolder("empty_folder")
-            addFolder("folder") {
+        val fsBuilder = FSBuilder().apply {
+            root.apply {
                 addFiles(
-                    "file_inner.txt" to "This is inner file.",
-                    "strangeF!LE" to "\n\ts\nt\tr\n\ta\ng\t\t\te\n\n\n\t"
+                    "empty.txt" to "",
+                    "file" to "This is file!",
                 )
-                addFolder("empty_folder_2")
-                addFolder("folder_2") {
+                addFolder("empty_folder")
+                addFolder("folder") {
                     addFiles(
-                        "empty_file" to ""
+                        "file_inner.txt" to "This is inner file.",
+                        "strangeF!LE" to "\n\ts\nt\tr\n\ta\ng\t\t\te\n\n\n\t"
                     )
+                    addFolder("empty_folder_2")
+                    addFolder("folder_2") {
+                        addFiles(
+                            "empty_file" to ""
+                        )
+                    }
                 }
             }
-        }.immutableFolder()
+        }
     }
 }

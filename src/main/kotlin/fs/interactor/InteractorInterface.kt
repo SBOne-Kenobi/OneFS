@@ -1,9 +1,8 @@
 package fs.interactor
 
-import fs.FolderNodeInterface
-import fs.MutableFolderNode
-import fs.proto.FileOrBuilder
-import fs.proto.FolderOrBuilder
+import fs.entity.DataCellController
+import fs.entity.MutableFileNode
+import fs.entity.MutableFolderNode
 
 /**
  * Interface for generating and save sequence of change events.
@@ -15,27 +14,18 @@ interface InteractorInterface {
      */
     fun getFileSystem(): MutableFolderNode
 
-    /**
-     * Override sequence with optimized change messages to create [rootNode].
-     */
-    suspend fun overrideFileWith(rootNode: FolderNodeInterface)
+    fun allocateNewData(minimalSize: Long): DataCellController
 
-    fun createFile(path: String, file: FileOrBuilder)
+    fun createFile(file: MutableFileNode)
 
-    fun deleteFile(path: String)
+    fun deleteFile(file: MutableFileNode)
 
-    fun moveFile(from: String, to: String)
+    fun updateFileRecord(file: MutableFileNode)
 
-    fun copyFile(from: String, to: String)
+    fun createFolder(folder: MutableFolderNode)
 
-    fun modifyFile(path: String, data: ByteArray, begin: Int, end: Int, timestamp: Long)
+    fun deleteFolder(folder: MutableFolderNode)
 
-    fun createFolder(path: String, folder: FolderOrBuilder)
-
-    fun deleteFolder(path: String)
-
-    fun moveFolder(from: String, to: String)
-
-    fun copyFolder(from: String, to: String)
+    fun updateFolderRecord(folder: MutableFolderNode)
 
 }

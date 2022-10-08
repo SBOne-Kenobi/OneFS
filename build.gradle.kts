@@ -1,11 +1,8 @@
-import com.google.protobuf.gradle.protobuf
-import com.google.protobuf.gradle.protoc
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
     id("idea")
     kotlin("jvm") version "1.7.10"
-    id("com.google.protobuf") version "0.8.19"
 }
 
 group = "org.example"
@@ -17,10 +14,11 @@ repositories {
 
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.4")
-    implementation("com.google.protobuf:protobuf-java:3.21.6")
+    implementation("commons-io:commons-io:2.11.0")
 
     testImplementation(kotlin("test"))
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test-jvm:1.6.4")
+    implementation(kotlin("reflect"))
 }
 
 tasks.test {
@@ -28,16 +26,10 @@ tasks.test {
 }
 
 tasks.withType<JavaCompile> {
-    sourceCompatibility = "1.8"
-    targetCompatibility = "1.8"
+    sourceCompatibility = "11"
+    targetCompatibility = "11"
 }
 
 tasks.withType<KotlinCompile> {
-    kotlinOptions.jvmTarget = "1.8"
-}
-
-protobuf {
-    protoc {
-        artifact = "com.google.protobuf:protoc:3.0.0"
-    }
+    kotlinOptions.jvmTarget = "11"
 }

@@ -1,10 +1,14 @@
 package fs
 
-import fs.proto.File
-import fs.proto.FileOrBuilder
-import fs.proto.Folder
-import fs.proto.FolderOrBuilder
-import fs.proto.MD5
+import fs.entity.FileNodeInterface
+import fs.entity.FolderNodeInterface
+import fs.entity.ItemRecord
+import fs.entity.NodeWithPath
+import fs.entity.add
+import fs.entity.mutable
+import fs.interactor.MemoryArea
+import java.io.InputStream
+import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import kotlinx.coroutines.flow.Flow
@@ -27,31 +31,32 @@ fun String.toPathSequence(): Sequence<String> {
     return res
 }
 
+fun getDigestMD5(): MessageDigest =
+    MessageDigest.getInstance("MD5")
+
 /**
  * Compute md5 hash.
  */
-fun ByteArray.computeMD5(): MD5 {
-    val md = MessageDigest.getInstance("MD5")
-    val bytes = md.digest(this).map { it.toULong() }
-    val little = bytes.drop(2).reduce { acc, byte -> acc.shl(Byte.SIZE_BITS) + byte }
-    val upper = bytes.take(2).reduce { acc, byte -> acc.shl(Byte.SIZE_BITS) + byte }
-    return MD5.newBuilder().apply {
-        this.little = little.toLong()
-        this.upper = upper.toLong()
-    }.build()
+fun ByteArray.computeMD5(): ByteArray {
+    val md = getDigestMD5()
+    return md.digest(this)
 }
 
-fun FileOrBuilder.build(): File = when (this) {
-    is File -> this
-    is File.Builder -> build()
-    else -> throw IllegalStateException("Unexpected type ${this::class}")
+fun InputStream.computeMD5(): ByteArray {
+    val md = getDigestMD5()
+    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+    while (true) {
+        val size = read(buffer)
+        if (size <= 0) {
+            break
+        }
+        md.update(buffer, 0, size)
+    }
+    return md.digest()
 }
 
-fun FolderOrBuilder.build(): Folder = when (this) {
-    is Folder -> this
-    is Folder.Builder -> build()
-    else -> throw IllegalStateException("Unexpected type ${this::class}")
-}
+val emptyMD5: ByteArray
+    get() = getDigestMD5().digest()
 
 /**
  * Generate flow of files with type [File].
@@ -87,14 +92,18 @@ suspend inline fun <reified File : FileNodeInterface, Folder: FolderNodeInterfac
 fun <T> List<*>.toInits(): MutableList<() -> T> =
     mapTo(mutableListOf()) { { throw IllegalStateException("Must be replaced!") } }
 
-fun Int.toByteArray(): ByteArray =
-    ByteBuffer.allocate(Int.SIZE_BYTES).putInt(this).array()
-
 fun ByteArray.toInt(): Int =
     ByteBuffer.wrap(this).int
 
-fun String.excludeLast(): String =
-    substringBeforeLast('/').takeIf { it.isNotBlank() } ?: "/"
+fun ItemRecord.toMemoryArea(): MemoryArea =
+    MemoryArea(beginRecordPosition, recordSize)
 
-fun String.lastName(): String =
-    substringAfterLast('/')
+fun OutputStream.skip(size: Long) {
+    val buffer = ByteArray(size.coerceAtMost(DEFAULT_BUFFER_SIZE.toLong()).toInt())
+    var remaining = size
+    while (remaining > 0) {
+        val nextSize = remaining.coerceAtMost(buffer.size.toLong()).toInt()
+        write(buffer, 0, nextSize)
+        remaining -= nextSize
+    }
+}

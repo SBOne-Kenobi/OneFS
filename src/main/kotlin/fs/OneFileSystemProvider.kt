@@ -4,10 +4,26 @@ import capturing.AccessCapture
 import capturing.ContextProvider
 import capturing.ReadContext
 import capturing.WriteContext
-import com.google.protobuf.ByteString
+import fs.entity.DirectoryAlreadyExists
+import fs.entity.DirectoryNotFound
+import fs.entity.FileAlreadyExists
+import fs.entity.FileNodeInterface
+import fs.entity.FileNotFound
+import fs.entity.MutableDataCell
+import fs.entity.MutableFSPath
+import fs.entity.MutableFileNode
+import fs.entity.MutableFolderNode
+import fs.entity.NodeWithPath
+import fs.entity.OneFileSystemException
+import fs.entity.add
+import fs.entity.copyFile
+import fs.entity.copyFolder
+import fs.entity.mutable
+import fs.entity.name
+import fs.entity.removeLast
 import fs.interactor.InteractorInterface
-import fs.proto.File
-import fs.proto.Folder
+import java.io.InputStream
+import java.io.OutputStream
 import java.nio.file.FileSystems
 import java.nio.file.PathMatcher
 import kotlin.io.path.Path
@@ -30,72 +46,54 @@ class OneFileSystemProvider(
     override suspend fun createWriteContext(): FileSystemWriteContext {
         return object : FileSystemWriteContext, AccessCapture<NavReadContext, NavWriteContext> by navigator {
 
-            override suspend fun NavWriteContext.optimize() {
-                interactor.overrideFileWith(rootFolder)
-            }
-
             override fun NavWriteContext.createFolder(name: String) {
                 currentFolder.apply {
-                    if (folders.firstOrNull { it.folder.name == name } != null) {
+                    if (folders.firstOrNull { it.folderName == name } != null) {
                         throw DirectoryAlreadyExists(currentPath.path + name)
                     }
-                    val folder = Folder.newBuilder().apply { this.name = name }
-                    folders.add(MutableFolderNode(folder, parent = this))
-                    interactor.createFolder(currentPath.path + name, folder)
+                    val folder = MutableFolderNode(name, parent = this)
+                    folders.add(folder)
+                    interactor.createFolder(folder)
                 }
             }
 
-            override fun NavWriteContext.createFile(name: String) {
-                val file = File.newBuilder().apply {
-                    val creationTime = System.currentTimeMillis()
-                    this.name = name
-                    this.data = ByteString.EMPTY
-                    this.creationTimestamp = creationTime
-                    this.modificationTimestamp = creationTime
-                }.buildPartial()
-                createFile(file)
-            }
-
-            override fun NavWriteContext.createFile(file: File) {
-                val name = file.name
+            override fun NavWriteContext.createFile(
+                name: String,
+                data: ByteArray,
+                creationTimestamp: Long,
+                modificationTimestamp: Long,
+                md5: ByteArray,
+                dataCell: MutableDataCell?
+            ) {
+                val targetDataCell = dataCell ?: MutableDataCell(interactor.allocateNewData(data.size.toLong()))
                 currentFolder.apply {
-                    if (files.firstOrNull { it.file.name == name } != null) {
+                    if (files.firstOrNull { it.fileName == name } != null) {
                         throw FileAlreadyExists(currentPath.path + name)
                     }
-                    val newFile = File.newBuilder(file).apply {
-                        md5 = data.toByteArray().computeMD5()
-                    }
-                    files.add(MutableFileNode(newFile, parent = this))
-                    interactor.createFile(currentPath.path + name, file)
-                }
-            }
-
-            private fun NavWriteContext.deleteFolderImpl(name: String) {
-                currentFolder.apply {
-                    val success = folders.removeIf { it.folder.name == name }
-                    if (!success) {
-                        throw DirectoryNotFound(currentPath.path + name)
-                    }
+                    val file = MutableFileNode(
+                        name, targetDataCell, creationTimestamp, modificationTimestamp, md5, parent = this
+                    )
+                    files.add(file)
+                    interactor.createFile(file)
                 }
             }
 
             override fun NavWriteContext.deleteFolder(name: String) {
-                deleteFolderImpl(name)
-                interactor.deleteFolder(currentPath.path + name)
-            }
-
-            private fun NavWriteContext.deleteFileImpl(name: String) {
                 currentFolder.apply {
-                    val success = files.removeIf { it.file.name == name }
-                    if (!success) {
-                        throw FileNotFound(currentPath.path + name)
-                    }
+                    val folderPos = folders.indexOfFirst { it.folderName == name }.takeIf { it != -1 }
+                        ?: throw DirectoryNotFound(currentPath.path + name)
+                    val folder = folders.removeAt(folderPos)
+                    interactor.deleteFolder(folder)
                 }
             }
 
             override fun NavWriteContext.deleteFile(name: String) {
-                deleteFileImpl(name)
-                interactor.deleteFile(currentPath.path + name)
+                currentFolder.apply {
+                    val filePos = files.indexOfFirst { it.fileName == name }.takeIf { it != -1 }
+                        ?: throw FileNotFound(currentPath.path + name)
+                    val file = files.removeAt(filePos)
+                    interactor.deleteFile(file)
+                }
             }
 
             private fun NavWriteContext.getDestFolderAndNewName(
@@ -120,7 +118,7 @@ class OneFileSystemProvider(
 
                 path.pathList.forEach { nextName ->
                     destinationFolder = destinationFolder.folders.firstOrNull {
-                        it.folder.name == nextName
+                        it.folderName == nextName
                     } ?: throw DirectoryNotFound(destinationPath)
                     resultPath.add(destinationFolder)
                 }
@@ -129,11 +127,11 @@ class OneFileSystemProvider(
                 val (destFileIndexOrNull, fileName) = last?.let { lastName ->
                     if (lastIsFile) {
                         destinationFolder.files.indexOfFirst {
-                            it.file.name == lastName
+                            it.fileName == lastName
                         }.takeIf { it != -1 }
                     } else {
                         destinationFolder.folders.indexOfFirst {
-                            it.folder.name == lastName
+                            it.folderName == lastName
                         }.takeIf { it != -1 }
                     } to lastName
                 } ?: (null to null)
@@ -143,167 +141,148 @@ class OneFileSystemProvider(
 
             private fun NavWriteContext.transferFileImpl(
                 name: String, destinationPath: String, override: Boolean, isMove: Boolean,
-            ): String {
+            ) {
                 val srcFile = getFile(name)
 
-                val (destinationFolder, destFileIndexOrNull, newFileName, destFSPath) =
+                val (destinationFolder, destFileIndexOrNull, newFileName, _) =
                     getDestFolderAndNewName(destinationPath, lastIsFile = true)
 
                 if (destFileIndexOrNull != null) {
                     if (!override) {
                         throw FileAlreadyExists(destinationPath)
                     }
-                    destinationFolder.files.removeAt(destFileIndexOrNull)
+                    val deletedFile = destinationFolder.files.removeAt(destFileIndexOrNull)
+                    interactor.deleteFile(deletedFile)
                 }
-                val dstFile = srcFile.copyFile(destinationFolder)
                 if (isMove) {
-                    deleteFileImpl(name)
+                    srcFile.parent?.files?.remove(srcFile)
+                    srcFile.parent = destinationFolder
+                    newFileName?.let {
+                        srcFile.fileName = it
+                    }
+                    destinationFolder.files.add(srcFile)
+                    interactor.updateFileRecord(srcFile)
+                } else {
+                    val newFile = srcFile.copyFile(interactor, destinationFolder) {
+                        newFileName?.let {
+                            fileName = it
+                        }
+                    }
+                    destinationFolder.files.add(newFile)
                 }
-                newFileName?.let {
-                    dstFile.file.name = it
-                }
-                destinationFolder.files.add(dstFile)
-                return destFSPath.path + dstFile.file.name
             }
 
             private fun NavWriteContext.transferFolderImpl(
                 name: String, destinationPath: String, override: Boolean, isMove: Boolean,
-            ): String {
+            ) {
                 val srcFolder = getFolder(name)
 
-                val (destinationFolder, destFolderIndexOrNull, newFolderName, destFSPath) =
+                val (destinationFolder, destFolderIndexOrNull, newFolderName, _) =
                     getDestFolderAndNewName(destinationPath, lastIsFile = false)
 
                 if (destFolderIndexOrNull != null) {
                     if (!override) {
                         throw DirectoryAlreadyExists(destinationPath)
                     }
-                    destinationFolder.folders.removeAt(destFolderIndexOrNull)
+                    val deletedFolder = destinationFolder.folders.removeAt(destFolderIndexOrNull)
+                    interactor.deleteFolder(deletedFolder)
                 }
-                val dstFolder = srcFolder.copyFolder(destinationFolder)
                 if (isMove) {
-                    deleteFolderImpl(name)
+                    srcFolder.parent?.folders?.remove(srcFolder)
+                    srcFolder.parent = destinationFolder
+                    newFolderName?.let {
+                        srcFolder.folderName = it
+                    }
+                    destinationFolder.folders.add(srcFolder)
+                    interactor.updateFolderRecord(srcFolder)
+                } else {
+                    val newFolder = srcFolder.copyFolder(interactor, destinationFolder) {
+                        newFolderName?.let {
+                            folderName = it
+                        }
+                    }
+                    destinationFolder.folders.add(newFolder)
                 }
-                newFolderName?.let {
-                    dstFolder.folder.name = it
-                }
-                destinationFolder.folders.add(dstFolder)
-                return destFSPath.path + dstFolder.folder.name
             }
 
             override fun NavWriteContext.moveFile(name: String, destinationPath: String, override: Boolean) {
-                val resultDestPath = transferFileImpl(name, destinationPath, override, isMove = true)
-                interactor.moveFile(currentPath.path + name, resultDestPath)
+                transferFileImpl(name, destinationPath, override, isMove = true)
             }
 
             override fun NavWriteContext.moveFolder(name: String, destinationPath: String, override: Boolean) {
-                val resultDestPath = transferFolderImpl(name, destinationPath, override, isMove = true)
-                interactor.moveFolder(currentPath.path + name, resultDestPath)
+                transferFolderImpl(name, destinationPath, override, isMove = true)
             }
 
             override fun NavWriteContext.copyFile(name: String, destinationPath: String, override: Boolean) {
-                val resultDestPath = transferFileImpl(name, destinationPath, override, isMove = false)
-                interactor.copyFile(currentPath.path + name, resultDestPath)
+                transferFileImpl(name, destinationPath, override, isMove = false)
             }
 
             override fun NavWriteContext.copyFolder(name: String, destinationPath: String, override: Boolean) {
-                val resultDestPath = transferFolderImpl(name, destinationPath, override, isMove = false)
-                interactor.copyFolder(currentPath.path + name, resultDestPath)
+                transferFolderImpl(name, destinationPath, override, isMove = false)
             }
 
-            override fun NavWriteContext.writeIntoFile(name: String, data: ByteArray, begin: Int, end: Int) {
-                if ((begin == -1 && end != -1) || (begin != -1 && end != -1 && begin > end)) {
-                    throw OneFileSystemException("Incorrect range [$begin, $end)")
-                }
-                val fileNode = getFile(name)
-                val timestamp = System.currentTimeMillis()
-                fileNode.file.apply {
-                    val oldData = this.data.toByteArray()
-                    val indices = oldData.indices.toMutableList()
-                    val (prefix, suffix) = if (begin != -1) {
-                        if (begin < end || end == -1) {
-                            indices.removeIf { it >= begin && (end == -1 || it < end) }
-                        }
-                        indices.partition { it < begin }
-                    } else {
-                        indices to emptyList()
-                    }
-                    val newData = oldData.sliceArray(prefix) + data + oldData.sliceArray(suffix)
-                    this.data = ByteString.copyFrom(newData)
-                    this.md5 = newData.computeMD5()
-                    this.modificationTimestamp = timestamp
-                }
-                interactor.modifyFile(currentPath.path + name, data, begin, end, timestamp)
+            override fun NavWriteContext.outputStream(name: String, offset: Long): OutputStream {
+                val file = getFile(name)
+                return file.dataCell.getOutputStream(offset)
+            }
+
+            override fun NavWriteContext.updateMD5(name: String) {
+                val file = getFile(name)
+                file.md5 = file.dataCell.getInputStream().computeMD5()
+                interactor.updateFileRecord(file)
+            }
+
+            override fun NavWriteContext.clearFile(name: String) {
+                val file = getFile(name)
+                file.dataCell.clearData()
             }
 
             override fun NavWriteContext.appendIntoFile(name: String, data: ByteArray) {
-                writeIntoFile(name, data, -1, -1)
-            }
-
-            private fun registerImportedFile(
-                destPath: MutableFSPath,
-                fileNode: FileNodeInterface
-            ) {
-                interactor.createFile(destPath.path + fileNode.file.name, fileNode.file)
-            }
-
-            private fun registerImportedFolder(
-                destPath: MutableFSPath,
-                folderNode: FolderNodeInterface
-            ) {
-                interactor.createFolder(destPath.path + folderNode.folder.name, folderNode.folder)
-                destPath.add(folderNode)
-                folderNode.files.forEach {
-                    registerImportedFile(destPath, it)
+                outputStream(name, offset = -1).use {
+                    it.write(data)
                 }
-                folderNode.folders.forEach {
-                    registerImportedFolder(destPath, it)
-                }
-                destPath.removeLast()
             }
 
-            /**
-             * Create importing file using [file] in [destinationPath].
-             */
-            override fun NavWriteContext.importFile(destinationPath: String, file: () -> MutableFileNode) {
-                val (destinationFolder, fileIndex, fileName, destPath) =
+            override fun <FileId> NavWriteContext.importFile(
+                destinationPath: String,
+                importer: Importer<FileId, *>,
+                fileId: FileId
+            ) {
+                val (destinationFolder, fileIndex, fileName, _) =
                     getDestFolderAndNewName(destinationPath, lastIsFile = true)
                 if (fileIndex != null) {
                     throw FileAlreadyExists(destinationPath)
                 }
+                if (fileName != null) {
+                    System.err.println("Selected file name $fileName will be ignored")
+                }
                 val targetFile = try {
-                    file()
+                    importer.importFile(interactor, destinationFolder, fileId)
                 } catch (e: Throwable) {
                     throw OneFileSystemException("Failed while importing", e)
                 }
-                fileName?.let {
-                    targetFile.file.name = it
-                }
-                targetFile.parent = destinationFolder
                 destinationFolder.files.add(targetFile)
-                registerImportedFile(destPath, targetFile)
             }
 
-            /**
-             * Create importing directory using [dir] in [destinationPath].
-             */
-            override fun NavWriteContext.importDirectory(destinationPath: String, dir: () -> MutableFolderNode) {
-                val (destinationFolder, dirIndex, dirName, destPath) =
+            override fun <FolderId> NavWriteContext.importDirectory(
+                destinationPath: String,
+                importer: Importer<*, FolderId>,
+                folderId: FolderId
+            ) {
+                val (destinationFolder, dirIndex, dirName, _) =
                     getDestFolderAndNewName(destinationPath, lastIsFile = false)
                 if (dirIndex != null) {
                     throw DirectoryAlreadyExists(destinationPath)
                 }
+                if (dirName != null) {
+                    System.err.println("Selected directory name $dirName will be ignored")
+                }
                 val targetDir = try {
-                    dir()
+                    importer.importFolder(interactor, destinationFolder, folderId)
                 } catch (e: Throwable) {
                     throw OneFileSystemException("Failed while importing", e)
                 }
-                dirName?.let {
-                    targetDir.folder.name = it
-                }
-                targetDir.parent = destinationFolder
                 destinationFolder.folders.add(targetDir)
-                registerImportedFolder(destPath, targetDir)
             }
         }
     }
@@ -331,16 +310,20 @@ interface FileSystemReadContext : ReadContext, WithNavigator {
         }
     }
 
+    fun NavContextGeneric.inputStream(name: String): InputStream =
+        getFile(name).dataCell.getInputStream()
+
     fun NavContextGeneric.readFile(name: String): ByteArray =
-        getFile(name).file.data.toByteArray()
+        inputStream(name).use { it.readBytes() }
 
     /**
      * Validate all files in current directory.
      */
     suspend fun NavContextGeneric.validate(): Boolean {
         return getFlowOfFiles(recursive = true).fold(true) { acc, (fileNode, _) ->
-            acc && fileNode.file.run {
-                md5 == data.toByteArray().computeMD5()
+            acc && fileNode.run {
+                val targetMd5 = dataCell.getInputStream().computeMD5()
+                md5.contentEquals(targetMd5)
             }
         }
     }
@@ -349,16 +332,16 @@ interface FileSystemReadContext : ReadContext, WithNavigator {
 
 interface FileSystemWriteContext : WriteContext, FileSystemReadContext {
 
-    /**
-     * Optimize file size of OneFS.
-     */
-    suspend fun NavWriteContext.optimize()
-
     fun NavWriteContext.createFolder(name: String)
 
-    fun NavWriteContext.createFile(name: String)
-
-    fun NavWriteContext.createFile(file: File)
+    fun NavWriteContext.createFile(
+        name: String,
+        data: ByteArray = ByteArray(0),
+        creationTimestamp: Long = System.currentTimeMillis(),
+        modificationTimestamp: Long = creationTimestamp,
+        md5: ByteArray = data.computeMD5(),
+        dataCell: MutableDataCell? = null
+    )
 
     fun NavWriteContext.deleteFolder(name: String)
 
@@ -373,23 +356,27 @@ interface FileSystemWriteContext : WriteContext, FileSystemReadContext {
     fun NavWriteContext.copyFolder(name: String, destinationPath: String, override: Boolean = false)
 
     /**
-     * Rewrite content of file [name] placed from [begin] (include) to [end] (exclude) with [data].
+     * Creates [OutputStream] for file [name] with [offset] from begin of specified file.
      *
-     * If [end] equals -1 it means to end of file.
+     * Note: [offset] may be -1, it will mean the end of file.
      */
-    fun NavWriteContext.writeIntoFile(name: String, data: ByteArray, begin: Int = 0, end: Int = -1)
+    fun NavWriteContext.outputStream(name: String, offset: Long = -1): OutputStream
+
+    fun NavWriteContext.updateMD5(name: String)
+
+    fun NavWriteContext.clearFile(name: String)
 
     fun NavWriteContext.appendIntoFile(name: String, data: ByteArray)
 
     /**
-     * Create importing file using [file] in [destinationPath].
+     * Create importing file with [fileId] using [importer] in [destinationPath].
      */
-    fun NavWriteContext.importFile(destinationPath: String, file: () -> MutableFileNode)
+    fun <FileId> NavWriteContext.importFile(destinationPath: String, importer: Importer<FileId, *>, fileId: FileId)
 
     /**
-     * Create importing directory using [dir] in [destinationPath].
+     * Create importing directory with [folderId] using [importer] in [destinationPath].
      */
-    fun NavWriteContext.importDirectory(destinationPath: String, dir: () -> MutableFolderNode)
+    fun <FolderId> NavWriteContext.importDirectory(destinationPath: String, importer: Importer<*, FolderId>, folderId: FolderId)
 
 }
 

@@ -5,18 +5,21 @@ This project is a FileSystem that stores all information about self in one file.
 ## Implementation details
 - Created interface `AccessCapture` in package `capturing` for multithread working with readers and writers with different strategies.
 - There are some default strategies described in package `capturing.impl`, but also there is possibility of creation your own strategies. 
-- Storage format of FileSystem using protobuf.
-- Storage format is a sequence of change events that lets efficient add a lot of new mutations.
-- Also, created interface `InteractorInterface` for generating a sequence of change messages.
+- Storage format of FileSystem is described in `fs/entity/FSFormat.kt`.
+- Storage format is sequence of files and folders records with pointers to each other.
+- There are pointers to content of file.
+- Created interface `InteractorInterface` for working with records and overrides them.
+- Supported strategies of allocation of datas.
 
 ### Future improvement
-- Encapsulate working with protobuf for better practices.
 - Provide easy-to-use interface for working with OneFileSystem.
+- Provide better allocation strategies.
 
 ## Usage
 Create OneFileSystem provider and choose strategy for working with FS.
 ```kotlin 
-val interactor = FSInteractor(fileSystemPath)
+val allocator = SimpleAllocator()
+val interactor = FSInteractor(fileSystemPath, allocator)
 val provider = OneFileSystemProvider(interactor)
 val capture = ReadPriorityCapture(provider)
 ```
@@ -29,12 +32,8 @@ capture.captureWrite {
         
         createFile("new_file") // create new file
         
-        writeIntoFile("new_file", "This is Content".toByteArray()) // write some content
+        appendIntoFile("new_file", "This is Content".toByteArray()) // write some content
         // result content is "This is Content"
-        writeIntoFile("new_file", "not c".toByteArray(), begin = 8, end = 9) // change this content
-        // result content is "This is not content"
-        
-        optimize() // Rewrite file system's file optmize number of generated messages 
     }
 }
 

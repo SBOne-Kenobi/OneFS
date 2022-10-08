@@ -1,9 +1,8 @@
-package fs
+package fs.entity
 
-import fs.proto.File
-import fs.proto.FileOrBuilder
-import fs.proto.Folder
-import fs.proto.FolderOrBuilder
+import fs.emptyMD5
+import fs.interactor.InteractorInterface
+import fs.toInits
 import utils.LazyList
 
 sealed interface FSNodeInterface {
@@ -16,35 +15,47 @@ sealed class MutableFSNode(final override var parent: MutableFolderNode?) : FSNo
 
 
 sealed interface FileNodeInterface : FSNodeInterface {
-    val file: FileOrBuilder
+    val fileName: String
+    val dataCell: DataCellInterface
+    val creationTimestamp: Long
+    val modificationTimestamp: Long
+    val md5: ByteArray
 }
 
 class MutableFileNode(
-    override val file: File.Builder,
+    override var fileName: String,
+    override val dataCell: MutableDataCell,
+    override var creationTimestamp: Long,
+    override var modificationTimestamp: Long,
+    override var md5: ByteArray = emptyMD5,
     parent: MutableFolderNode? = null
 ): MutableFSNode(parent), FileNodeInterface
 
 class FileNode(
-    override val file: File,
+    override val fileName: String,
+    override val dataCell: DataCell,
+    override val creationTimestamp: Long,
+    override val modificationTimestamp: Long,
+    override val md5: ByteArray = emptyMD5,
     parent: FolderNode? = null
 ): FSNode(parent), FileNodeInterface
 
 
 sealed interface FolderNodeInterface : FSNodeInterface {
-    val folder: FolderOrBuilder
+    val folderName: String
     val files: List<FileNodeInterface>
     val folders: List<FolderNodeInterface>
 }
 
 class MutableFolderNode(
-    override val folder: Folder.Builder,
+    override var folderName: String,
     override val files: MutableList<MutableFileNode> = mutableListOf(),
     override val folders: MutableList<MutableFolderNode> = mutableListOf(),
     parent: MutableFolderNode? = null
 ): MutableFSNode(parent), FolderNodeInterface
 
 class FolderNode(
-    override val folder: Folder,
+    override val folderName: String,
     override val files: List<FileNode> = emptyList(),
     override val folders: List<FolderNode> = emptyList(),
     parent: FolderNode? = null
@@ -52,13 +63,20 @@ class FolderNode(
 
 
 fun MutableFileNode.immutableFile(builtParent: FolderNode? = null): FileNode =
-    FileNode(file.build(), builtParent)
+    FileNode(
+        fileName,
+        DataCell(dataCell.controller),
+        creationTimestamp,
+        modificationTimestamp,
+        md5,
+        builtParent
+    )
 
 fun MutableFolderNode.immutableFolder(builtParent: FolderNode? = null): FolderNode {
     val initsFolder = folders.toInits<FolderNode>()
     val initsFiles = files.toInits<FileNode>()
     val result = FolderNode(
-        folder.build(),
+        folderName,
         LazyList(initsFiles),
         LazyList(initsFolder),
         builtParent
@@ -68,27 +86,34 @@ fun MutableFolderNode.immutableFolder(builtParent: FolderNode? = null): FolderNo
     return result
 }
 
-fun MutableFSNode.immutableNode(builtParent: FolderNode? = null): FSNode = when (this) {
-    is MutableFileNode -> immutableFile(builtParent)
-    is MutableFolderNode -> immutableFolder(builtParent)
-}
+fun MutableFileNode.copyFile(
+    interactor: InteractorInterface,
+    parent: MutableFolderNode? = null,
+    change: MutableFileNode.() -> Unit = {}
+): MutableFileNode =
+    MutableFileNode(
+        fileName,
+        MutableDataCell(dataCell.controller.createDeepCopy()),
+        creationTimestamp,
+        modificationTimestamp,
+        md5.copyOf(),
+        parent
+    ).apply {
+        change()
+        interactor.createFile(this)
+    }
 
-fun MutableFileNode.copyFile(parent: MutableFolderNode? = null): MutableFileNode =
-    MutableFileNode(File.newBuilder(file.build()), parent)
-
-fun MutableFolderNode.copyFolder(parent: MutableFolderNode? = null): MutableFolderNode {
-    val result = MutableFolderNode(
-        Folder.newBuilder(folder.build()),
-        parent = parent
-    )
-    result.files.addAll(files.map { it.copyFile(result) })
-    result.folders.addAll(folders.map { it.copyFolder(result) })
+fun MutableFolderNode.copyFolder(
+    interactor: InteractorInterface,
+    parent: MutableFolderNode? = null,
+    change: MutableFolderNode.() -> Unit = {}
+): MutableFolderNode {
+    val result = MutableFolderNode(folderName, parent = parent)
+    result.change()
+    interactor.createFolder(result)
+    result.files.addAll(files.map { it.copyFile(interactor, result) })
+    result.folders.addAll(folders.map { it.copyFolder(interactor, result) })
     return result
-}
-
-fun MutableFSNode.copyNode(parent: MutableFolderNode? = null): MutableFSNode = when (this) {
-    is MutableFileNode -> copyFile(parent)
-    is MutableFolderNode -> copyFolder(parent)
 }
 
 val FSNodeInterface.path: MutableFSPath
