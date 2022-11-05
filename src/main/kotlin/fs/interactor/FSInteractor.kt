@@ -1,9 +1,15 @@
 package fs.interactor
 
+import fs.emptyMD5
+import fs.entity.DataCell
 import fs.entity.DataCellController
 import fs.entity.DataPointer
 import fs.entity.DataPointerObserver
+import fs.entity.FSNode
+import fs.entity.FSPath
+import fs.entity.FileNode
 import fs.entity.FileRecord
+import fs.entity.FolderNode
 import fs.entity.FolderRecord
 import fs.entity.FreeRecord
 import fs.entity.HEADER_SIZE
@@ -13,14 +19,22 @@ import fs.entity.ItemRecord
 import fs.entity.LONG_SIZE
 import fs.entity.MAX_NAME_SIZE
 import fs.entity.MutableDataCell
-import fs.entity.MutableFSNode
-import fs.entity.MutableFileNode
-import fs.entity.MutableFolderNode
+import fs.entity.NodeLoader
 import fs.entity.OneFileSystemException
+import fs.entity.ParseError
 import fs.entity.RowUsedContentRecord
+import fs.entity.addFile
+import fs.entity.addFolder
+import fs.entity.getRecords
+import fs.entity.name
 import fs.entity.parseNextRecord
+import fs.entity.removeLast
 import fs.entity.writeRecord
-import fs.toMemoryArea
+import fs.readLong
+import fs.toDataCell
+import fs.toMutableDataCell
+import fs.toPointer
+import fs.writeLong
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
@@ -39,7 +53,7 @@ import utils.RandomAccessFileOutputStream
 /**
  * Interactor for working with filesystem's file.
  */
-class FSInteractor(val fileSystemPath: Path, private val allocator: Allocator) : InteractorInterface, AutoCloseable {
+class FSInteractor(val fileSystemPath: Path) : InteractorInterface, AutoCloseable {
 
     init {
         if (fileSystemPath.notExists()) {
@@ -49,6 +63,7 @@ class FSInteractor(val fileSystemPath: Path, private val allocator: Allocator) :
                     it, FolderRecord(
                         name = "",
                         ItemPointer(beginPosition = -1),
+                        childrenPointer = ItemPointer(beginPosition = -1),
                         beginRecordPosition = 0
                     )
                 )
@@ -58,14 +73,19 @@ class FSInteractor(val fileSystemPath: Path, private val allocator: Allocator) :
         }
     }
 
-    private fun getRAF() = RandomAccessFile(fileSystemPath.toFile(), "rw")
+    enum class RAFAccess(val flags: String) {
+        READ("r"),
+        WRITE("rw")
+    }
 
-    private inner class FileDataCellController(private val recordPosition: Long) : DataCellController {
+    private fun getRAF(access: RAFAccess) = RandomAccessFile(fileSystemPath.toFile(), access.flags)
 
-        var fileRecordPosition by Delegates.notNull<Long>()
+    private inner class PointedDataCellController(private val recordPosition: Long) : DataCellController {
+
+        var pointerPosition by Delegates.notNull<Long>()
 
         private inner class LengthUpdater : DataPointerObserver {
-            private val raf = getRAF()
+            private val raf = getRAF(RAFAccess.WRITE)
             private val position = recordPosition + HEADER_SIZE
 
             override fun lengthOnChange(newValue: Long) {
@@ -80,12 +100,7 @@ class FSInteractor(val fileSystemPath: Path, private val allocator: Allocator) :
         }
 
         override val dataPointer: DataPointer by lazy {
-            val raf = getRAF()
-            raf.seek(recordPosition)
-            val inputStream = RandomAccessFileInputStream(raf)
-            val record = parseNextRecord(inputStream, recordPosition) as RowUsedContentRecord
-            inputStream.close()
-            raf.close()
+            val record = readRecord(recordPosition) as RowUsedContentRecord
 
             DataPointer(
                 record.beginRecordPosition + EXTENDED_DATA_HEADER_SIZE,
@@ -96,24 +111,23 @@ class FSInteractor(val fileSystemPath: Path, private val allocator: Allocator) :
         }
 
         override fun getInputStream(): InputStream {
-            val raf = getRAF()
+            val raf = getRAF(RAFAccess.READ)
             raf.seek(dataPointer.beginPosition)
             return RandomAccessFileInputStream(raf, true)
         }
 
         override fun getOutputStream(offset: Long): OutputStream {
-            val raf = getRAF()
+            val raf = getRAF(RAFAccess.WRITE)
             raf.seek(dataPointer.beginPosition + offset)
             return RandomAccessFileOutputStream(raf, closeOnClose = true)
         }
 
         override fun allocateNew(newMinimalSize: Long): DataCellController {
-            return allocateNewData(newMinimalSize).also {
+            return allocateRowRecord(newMinimalSize).also {
                 // change pointer in file record
-                it as FileDataCellController
-                it.fileRecordPosition = fileRecordPosition
-                val raf = getRAF()
-                raf.seek(fileRecordPosition + HEADER_SIZE + MAX_NAME_SIZE + ITEM_POINTER_SIZE)
+                it.pointerPosition = pointerPosition
+                val raf = getRAF(RAFAccess.WRITE)
+                raf.seek(pointerPosition)
                 raf.writeLong(it.recordPosition)
                 raf.close()
             }
@@ -122,20 +136,6 @@ class FSInteractor(val fileSystemPath: Path, private val allocator: Allocator) :
         override fun free() {
             makeRecordFree(recordPosition)
             close()
-        }
-
-        /**
-         * Don't use [allocateNew] without register and connection new data with any file.
-         */
-        override fun createDeepCopy(): DataCellController {
-            val newController = allocateNewData(dataPointer.dataLength)
-            BoundedInputStream(getInputStream(), dataPointer.dataLength).use { input ->
-                newController.getOutputStream(0).use { output ->
-                    input.copyTo(output)
-                }
-            }
-            newController.dataPointer.dataLength = dataPointer.dataLength
-            return newController
         }
 
         override fun close() {
@@ -151,200 +151,364 @@ class FSInteractor(val fileSystemPath: Path, private val allocator: Allocator) :
 
     }
 
-    private fun getDataCell(filePosition: Long, beginPosition: Long): MutableDataCell {
-        val dataCellController = FileDataCellController(beginPosition)
-        dataCellController.fileRecordPosition = filePosition
-        return MutableDataCell(dataCellController)
-    }
-
-    private val positionToNode: MutableMap<Long, MutableFSNode> = mutableMapOf()
-    private val nodeToPosition: MutableMap<MutableFSNode, Long> = mutableMapOf()
-
-    private fun registerNewNodeWithPosition(node: MutableFSNode, position: Long) {
-        positionToNode[position] = node
-        nodeToPosition[node] = position
-    }
-
-    private fun unregisterNode(node: MutableFSNode) {
-        val position = nodeToPosition[node]
-        nodeToPosition.remove(node)
-        positionToNode.remove(position)
-    }
-
-    private fun MutableFSNode?.toPointer(): ItemPointer = if (this == null) {
-        ItemPointer(beginPosition = -1)
-    } else {
-        ItemPointer(nodeToPosition[this]!!)
-    }
-
-    private fun registerRecord(record: ItemRecord, initChain: MutableList<() -> Unit>): MutableFolderNode? =
-        when (record) {
-            is FileRecord -> {
-                val fileNode = MutableFileNode(
-                    record.name,
-                    getDataCell(record.beginRecordPosition, record.contentPointer.beginPosition),
-                    record.creationTimestamp,
-                    record.modificationTimestamp,
-                    record.md5
-                )
-                initChain.add {
-                    fileNode.parent = positionToNode[record.parentPointer.beginPosition] as MutableFolderNode?
-                    fileNode.parent?.files?.add(fileNode)
-                }
-                registerNewNodeWithPosition(fileNode, record.beginRecordPosition)
-                allocator.registerUsedArea(record.toMemoryArea())
-                null
-            }
-
-            is FolderRecord -> {
-                val folderNode = MutableFolderNode(record.name)
-                initChain.add {
-                    folderNode.parent = positionToNode[record.parentPointer.beginPosition] as MutableFolderNode?
-                    folderNode.parent?.folders?.add(folderNode)
-                }
-                registerNewNodeWithPosition(folderNode, record.beginRecordPosition)
-                allocator.registerUsedArea(record.toMemoryArea())
-                folderNode.takeIf { record.parentPointer.beginPosition == -1L }
-            }
-
-            is FreeRecord -> {
-                allocator.registerFreeArea(record.toMemoryArea())
-                null
-            }
-
-            is RowUsedContentRecord -> {
-                allocator.registerUsedArea(record.toMemoryArea())
-                null
-            }
+    private fun getFileController(fileRecord: FileRecord): PointedDataCellController =
+        PointedDataCellController(fileRecord.contentPointer.beginPosition).apply {
+            pointerPosition = fileRecord.beginRecordPosition + HEADER_SIZE + MAX_NAME_SIZE + ITEM_POINTER_SIZE
         }
 
-    override fun getFileSystem(): MutableFolderNode {
-        allocator.clear()
-        nodeToPosition.clear()
-        positionToNode.clear()
-
-        var rootNode: MutableFolderNode? = null
-        val initChain = mutableListOf<() -> Unit>()
-
-        val input = fileSystemPath.inputStream()
-        var currentPosition = 0L
-        while (true) {
-            val record = parseNextRecord(input, currentPosition) ?: break
-            currentPosition += record.recordSize
-            registerRecord(record, initChain)?.let {
-                rootNode = it
-            }
+    private fun getFolderChildrenController(folderRecord: FolderRecord): PointedDataCellController =
+        PointedDataCellController(folderRecord.childrenPointer.beginPosition).apply {
+            pointerPosition = folderRecord.beginRecordPosition + HEADER_SIZE + MAX_NAME_SIZE + ITEM_POINTER_SIZE
         }
-        initChain.forEach { it() }
-
-        return rootNode ?: throw OneFileSystemException("Root not found!")
-    }
 
     companion object {
-        private const val EXTENDED_DATA_HEADER_SIZE = HEADER_SIZE + LONG_SIZE + LONG_SIZE
+        private const val ROW_HEADER_SIZE = LONG_SIZE + LONG_SIZE
+        private const val EXTENDED_DATA_HEADER_SIZE = HEADER_SIZE + ROW_HEADER_SIZE
     }
 
     private fun writeRecord(record: ItemRecord) {
-        val raf = getRAF()
+        val raf = getRAF(RAFAccess.WRITE)
         raf.seek(record.beginRecordPosition)
         RandomAccessFileOutputStream(raf, closeOnClose = true).use {
             writeRecord(it, record)
         }
     }
 
-    override fun allocateNewData(minimalSize: Long): DataCellController {
-        val area = allocator.allocateNewData(EXTENDED_DATA_HEADER_SIZE + minimalSize)
-
-        val record = RowUsedContentRecord(
-            filledSize = 0,
-            area.size - EXTENDED_DATA_HEADER_SIZE,
-            area.begin
-        )
-        writeRecord(record)
-
-        return FileDataCellController(area.begin)
+    private fun readRecord(position: Long): ItemRecord {
+        val raf = getRAF(RAFAccess.READ)
+        raf.seek(position)
+        return RandomAccessFileInputStream(raf, true).use { input ->
+            parseNextRecord(input, position)!!
+        }
     }
 
     private fun makeRecordFree(position: Long) {
-        val raf = getRAF()
+        val raf = getRAF(RAFAccess.WRITE)
         raf.seek(position)
         // mark data free
         raf.write(0)
         raf.close()
-
-        val area = allocator.unregisterUsedArea(position)
-        allocator.registerFreeArea(area)
     }
 
-    private fun MutableFileNode.toFileRecord(beginPosition: Long) = FileRecord(
-        fileName,
-        parent.toPointer(),
-        ItemPointer(dataCell.controller.dataPointer.beginPosition - EXTENDED_DATA_HEADER_SIZE),
-        creationTimestamp,
-        modificationTimestamp,
-        md5,
-        beginPosition
-    )
-
-    private fun MutableFolderNode.toFolderRecord(beginPosition: Long) = FolderRecord(
-        folderName,
-        parent.toPointer(),
-        beginPosition
-    )
-
-    override fun createFile(file: MutableFileNode) {
-        val area = allocator.allocateNewData(HEADER_SIZE + FileRecord.DATA_SIZE.toLong(), fitted = true)
-
-        val record = file.toFileRecord(area.begin)
-        writeRecord(record)
-
-        registerNewNodeWithPosition(file, area.begin)
-    }
-
-    override fun deleteFile(file: MutableFileNode) {
-        val position = nodeToPosition[file]!!
-        makeRecordFree(position)
-        unregisterNode(file)
-    }
-
-    override fun updateFileRecord(file: MutableFileNode) {
-        val position = nodeToPosition[file]!!
-        val record = file.toFileRecord(position)
-        writeRecord(record)
-    }
-
-    override fun createFolder(folder: MutableFolderNode) {
-        val area = allocator.allocateNewData(HEADER_SIZE + FolderRecord.DATA_SIZE.toLong(), fitted = true)
-
-        val record = folder.toFolderRecord(area.begin)
-        writeRecord(record)
-        registerNewNodeWithPosition(folder, area.begin)
-    }
-
-    override fun deleteFolder(folder: MutableFolderNode) {
-        val position = nodeToPosition[folder]!!
-        makeRecordFree(position)
-        unregisterNode(folder)
-        folder.files.forEach {
-            deleteFile(it)
+    private fun FreeRecord.convertToRowRecord(): RowUsedContentRecord =
+        RowUsedContentRecord(
+            filledSize = 0,
+            sizeOfData - ROW_HEADER_SIZE,
+            beginRecordPosition
+        ).also {
+            writeRecord(it)
         }
-        folder.folders.forEach {
-            deleteFolder(it)
+
+    private fun allocateRowRecord(minimalDataSize: Long): PointedDataCellController {
+        val record = findFreeSpace(ROW_HEADER_SIZE + minimalDataSize, fit = false)
+            .convertToRowRecord()
+        return PointedDataCellController(record.beginRecordPosition)
+    }
+
+    private fun findFreeSpace(minimalDataSize: Long, fit: Boolean): FreeRecord {
+        var fileSize = 0L
+        var record = fileSystemPath.inputStream().use { input ->
+            input.getRecords().find { record ->
+                fileSize += record.recordSize
+                if (record is FreeRecord) {
+                    if (fit) {
+                        record.sizeOfData == minimalDataSize
+                    } else {
+                        record.sizeOfData >= minimalDataSize
+                    }
+                } else {
+                    false
+                }
+            }
+        } as FreeRecord?
+        if (record == null) {
+            record = FreeRecord(minimalDataSize, fileSize)
+            writeRecord(record)
         }
+
+        return record
     }
 
-    override fun updateFolderRecord(folder: MutableFolderNode) {
-        val position = nodeToPosition[folder]!!
-        val record = folder.toFolderRecord(position)
-        writeRecord(record)
-    }
-
-    override fun close() {
-        nodeToPosition.keys.forEach {
-            if (it is MutableFileNode) {
-                it.dataCell.controller.close()
+    private fun FolderRecord.getChildren(): Sequence<ItemRecord> = sequence {
+        getRAF(RAFAccess.READ).use { raf ->
+            val children = readRecord(childrenPointer.beginPosition) as RowUsedContentRecord
+            val position = children.beginRecordPosition + EXTENDED_DATA_HEADER_SIZE
+            raf.seek(position)
+            BoundedInputStream(RandomAccessFileInputStream(raf), children.filledSize).use { input ->
+                while (true) {
+                    val childPosition = try {
+                        input.readLong()
+                    } catch (_: ParseError) {
+                        break
+                    }
+                    yield(readRecord(childPosition))
+                }
             }
         }
     }
+
+    private fun findRecord(path: FSPath): ItemRecord {
+        var currentRecord = fileSystemPath.inputStream().use { input ->
+            input.getRecords().find {
+                it is FolderRecord && it.name == "" && it.parentPointer.beginPosition == -1L
+            } as FolderRecord
+        }
+        val lastIndex = path.pathList.lastIndex
+        path.pathList.forEachIndexed { index, name ->
+            val targetRecord = currentRecord.getChildren().find { childRecord ->
+                when (childRecord) {
+                    is FileRecord -> childRecord.name == name
+                    is FolderRecord -> childRecord.name == name
+                    else -> false
+                }
+            } ?: throw OneFileSystemException("${path.pathString} is not found!")
+            if (targetRecord is FolderRecord) {
+                currentRecord = targetRecord
+            } else {
+                if (index == lastIndex) {
+                    return targetRecord
+                } else {
+                    throw OneFileSystemException("Unexpected file $name")
+                }
+            }
+        }
+        return currentRecord
+    }
+
+    private fun FolderRecord.addChild(position: Long) {
+        getFolderChildrenController(this)
+            .toMutableDataCell()
+            .getOutputStream(offset = -1)
+            .use { output ->
+                output.writeLong(position)
+            }
+    }
+
+    private fun FolderRecord.removeChild(position: Long) {
+        val children = getChildren().toMutableList().apply {
+            removeIf { it.beginRecordPosition == position }
+        }
+        getFolderChildrenController(this)
+            .toMutableDataCell()
+            .apply { clearData() }
+            .getOutputStream(offset = -1)
+            .use { output ->
+                children.forEach {
+                    output.writeLong(it.beginRecordPosition)
+                }
+            }
+    }
+
+
+    override fun createFile(path: FSPath) {
+        val parentRecord = findRecord(path.removeLast()) as FolderRecord
+
+        val contentRecord = findFreeSpace(ROW_HEADER_SIZE + 20L, fit = false)
+            .convertToRowRecord()
+        val freeRecord = findFreeSpace(FileRecord.DATA_SIZE.toLong(), fit = true)
+
+        val currentTime = System.currentTimeMillis()
+        val fileRecord = FileRecord(
+            path.name,
+            parentRecord.toPointer(),
+            contentRecord.toPointer(),
+            currentTime,
+            currentTime,
+            emptyMD5,
+            freeRecord.beginRecordPosition
+        )
+        writeRecord(fileRecord)
+
+        parentRecord.addChild(fileRecord.beginRecordPosition)
+    }
+
+    override fun deleteFile(path: FSPath) {
+        val record = findRecord(path) as FileRecord
+        val parentRecord = readRecord(record.parentPointer.beginPosition) as FolderRecord
+
+        parentRecord.removeChild(record.beginRecordPosition)
+        makeRecordFree(record.beginRecordPosition)
+        makeRecordFree(record.contentPointer.beginPosition)
+    }
+
+    override fun moveFile(sourcePath: FSPath, destinationPath: FSPath) {
+        val sourceFile = findRecord(sourcePath) as FileRecord
+
+        val sourceParent = readRecord(sourceFile.parentPointer.beginPosition) as FolderRecord
+        val destParent = findRecord(destinationPath.removeLast()) as FolderRecord
+
+        val newFileRecord = FileRecord(
+            destinationPath.name,
+            destParent.toPointer(),
+            sourceFile.contentPointer,
+            sourceFile.creationTimestamp,
+            sourceFile.modificationTimestamp,
+            sourceFile.md5,
+            sourceFile.beginRecordPosition
+        )
+
+        sourceParent.removeChild(sourceFile.beginRecordPosition)
+        destParent.addChild(newFileRecord.beginRecordPosition)
+
+        writeRecord(newFileRecord)
+    }
+
+    override fun setMD5(path: FSPath, md5: ByteArray) {
+        val record = findRecord(path) as FileRecord
+        val offset = HEADER_SIZE + MAX_NAME_SIZE + 2 * ITEM_POINTER_SIZE + 2 * LONG_SIZE
+
+        getRAF(RAFAccess.WRITE).use {
+            it.seek(record.beginRecordPosition + offset)
+            it.write(md5)
+        }
+    }
+
+    private inner class CachedLoader<T : FSNode>(val delegate: NodeLoader<T>) : NodeLoader<T> {
+        @Suppress("UNCHECKED_CAST")
+        private val node: T
+            get() {
+                cache?.let { return it }
+                return delegate.load().also {
+                    cache = it
+                }
+            }
+
+        private var cache: T? = null
+
+        override val name: String by delegate::name
+        override val path: FSPath by delegate::path
+
+        override fun load(): T = node
+
+        override fun close() {
+            delegate.close()
+            cache = null
+        }
+    }
+
+    private inner class NodeLoaderByRecord<T : FSNode>(
+        override val path: FSPath,
+        val recordPosition: Long,
+        val transform: (path: FSPath, ItemRecord) -> T
+    ) : NodeLoader<T> {
+        override val name: String = path.name
+
+        override fun load(): T = transform(path, readRecord(recordPosition))
+
+        override fun close() {}
+
+    }
+
+    private fun recordToFolderLoader(path: FSPath, position: Long) =
+        NodeLoaderByRecord(path, position, ::recordToFolderNode)
+
+    private fun recordToFileLoader(path: FSPath, position: Long) =
+        NodeLoaderByRecord(path, position, ::recordToFileNode)
+
+    private fun recordToFileNode(path: FSPath, itemRecord: ItemRecord): FileNode {
+        itemRecord as FileRecord
+        return FileNode(
+            itemRecord.name,
+            itemRecord.creationTimestamp,
+            itemRecord.modificationTimestamp,
+            itemRecord.md5,
+            recordToFolderLoader(path.removeLast(), itemRecord.parentPointer.beginPosition)
+        )
+    }
+
+    private fun recordToFolderNode(path: FSPath, itemRecord: ItemRecord): FolderNode {
+        itemRecord as FolderRecord
+        val (files, folders) = itemRecord
+            .getChildren()
+            .partition { it is FileRecord }
+
+        val parentLoader = if (path.pathList.isEmpty()) {
+            null
+        } else {
+            recordToFolderLoader(path.removeLast(), itemRecord.parentPointer.beginPosition)
+        }
+
+        return FolderNode(
+            itemRecord.name,
+            files.map {
+                it as FileRecord
+                recordToFileLoader(path.addFile(it.name), it.beginRecordPosition)
+            },
+            folders.map {
+                it as FolderRecord
+                recordToFolderLoader(path.addFolder(it.name), it.beginRecordPosition)
+            },
+            parentLoader
+        )
+    }
+
+    override fun getFileLoader(path: FSPath): NodeLoader<FileNode> {
+        val record = findRecord(path)
+        val mainLoader = recordToFileLoader(path, record.beginRecordPosition)
+        return CachedLoader(mainLoader)
+    }
+
+    override fun getDataCell(path: FSPath): DataCell {
+        val record = findRecord(path) as FileRecord
+        return getFileController(record).toDataCell()
+    }
+
+    override fun getMutableDataCell(path: FSPath): MutableDataCell {
+        val record = findRecord(path) as FileRecord
+        return getFileController(record).toMutableDataCell()
+    }
+
+    override fun createFolder(path: FSPath) {
+        val parentRecord = findRecord(path.removeLast()) as FolderRecord
+
+        val children = findFreeSpace(10L * LONG_SIZE, fit = false).convertToRowRecord()
+        val freeRecord = findFreeSpace(HEADER_SIZE + FolderRecord.DATA_SIZE.toLong(), fit = true)
+
+        val folderRecord = FolderRecord(
+            path.name,
+            parentRecord.toPointer(),
+            children.toPointer(),
+            freeRecord.beginRecordPosition
+        )
+        writeRecord(folderRecord)
+
+        parentRecord.addChild(folderRecord.beginRecordPosition)
+    }
+
+    override fun deleteFolder(path: FSPath) {
+        val folderRecord = findRecord(path) as FolderRecord
+        val parentRecord = readRecord(folderRecord.parentPointer.beginPosition) as FolderRecord
+
+        parentRecord.removeChild(folderRecord.beginRecordPosition)
+        makeRecordFree(folderRecord.beginRecordPosition)
+        makeRecordFree(folderRecord.childrenPointer.beginPosition)
+    }
+
+    override fun moveFolder(sourcePath: FSPath, destinationPath: FSPath) {
+        val sourceFolder = findRecord(sourcePath) as FolderRecord
+
+        val sourceParent = readRecord(sourceFolder.parentPointer.beginPosition) as FolderRecord
+        val destParent = findRecord(destinationPath.removeLast()) as FolderRecord
+
+        val newFolderRecord = FolderRecord(
+            destinationPath.name,
+            destParent.toPointer(),
+            sourceFolder.childrenPointer,
+            sourceFolder.beginRecordPosition
+        )
+
+        sourceParent.removeChild(sourceFolder.beginRecordPosition)
+        destParent.addChild(newFolderRecord.beginRecordPosition)
+
+        writeRecord(newFolderRecord)
+    }
+
+    override fun getFolderLoader(path: FSPath): NodeLoader<FolderNode> {
+        val record = findRecord(path)
+        val mainLoader = recordToFolderLoader(path, record.beginRecordPosition)
+        return CachedLoader(mainLoader)
+    }
+
+    override fun close() {}
 
 }

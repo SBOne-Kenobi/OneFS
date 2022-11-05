@@ -4,9 +4,11 @@ import fs.entity.FileRecord
 import fs.entity.FolderRecord
 import fs.entity.ItemPointer
 import fs.entity.ItemRecord
+import fs.entity.LONG_SIZE
 import fs.entity.RowUsedContentRecord
 import fs.entity.writeRecord
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.nio.file.Path
 import kotlin.io.path.outputStream
 
@@ -51,15 +53,33 @@ class FolderBuilder {
     var position: Long = 0
 
     fun build(parent: FolderBuilder?, builder: FSBuilder) {
+        val childrenPosition = builder.wrote
+        val childrenCount = fileBuilders.size + folderBuilders.size
+        val childrenData = ByteArray(LONG_SIZE * childrenCount)
+        builder.addRecord(RowUsedContentRecord(
+            LONG_SIZE * childrenCount.toLong(),
+            LONG_SIZE * childrenCount.toLong(),
+            childrenPosition
+        ), childrenData)
+
         position = builder.wrote
         builder.addRecord(FolderRecord(
             folderName,
             ItemPointer(parent?.position ?: -1),
+            ItemPointer(childrenPosition),
             position
         ))
 
-        fileBuilders.forEach { it.build( this, builder) }
-        folderBuilders.forEach { it.build(this, builder) }
+        val output = ByteArrayOutputStream()
+        fileBuilders.forEach {
+            it.build( this, builder)
+            output.writeLong(it.position)
+        }
+        folderBuilders.forEach {
+            it.build(this, builder)
+            output.writeLong(it.position)
+        }
+        output.toByteArray().copyInto(childrenData)
     }
 }
 
@@ -70,6 +90,8 @@ class FileBuilder {
     var modificationTimestamp: Long = 0
     lateinit var md5: ByteArray
 
+    var position: Long = 0
+
     fun build(parent: FolderBuilder, builder: FSBuilder) {
         val dataPosition = builder.wrote
         builder.addRecord(RowUsedContentRecord(
@@ -78,7 +100,7 @@ class FileBuilder {
             dataPosition
         ), data)
 
-        val position = builder.wrote
+        position = builder.wrote
         builder.addRecord(FileRecord(
             fileName,
             ItemPointer(parent.position),

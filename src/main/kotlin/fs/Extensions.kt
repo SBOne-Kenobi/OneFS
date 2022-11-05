@@ -1,20 +1,24 @@
 package fs
 
-import fs.entity.FileNodeInterface
-import fs.entity.FolderNodeInterface
+import fs.entity.DataCell
+import fs.entity.DataCellController
+import fs.entity.FSPath
+import fs.entity.FileNode
+import fs.entity.FolderNode
+import fs.entity.ItemPointer
 import fs.entity.ItemRecord
-import fs.entity.NodeWithPath
-import fs.entity.add
-import fs.entity.mutable
-import fs.interactor.MemoryArea
+import fs.entity.LONG_SIZE
+import fs.entity.MutableDataCell
+import fs.entity.NodeLoader
+import fs.entity.ParseError
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.asFlow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.map
 
 /**
  * Split path string into sequence of folders/files names.
@@ -59,44 +63,31 @@ val emptyMD5: ByteArray
     get() = getDigestMD5().digest()
 
 /**
- * Generate flow of files with type [File].
+ * Generate flow of files.
  */
-suspend inline fun <reified File : FileNodeInterface, Folder: FolderNodeInterface> NavContext<File, Folder>.getFlowOfFiles(
+suspend fun NavContext.getFlowOfFiles(
     recursive: Boolean
-): Flow<NodeWithPath<File>> {
+): Flow<NodeLoader<FileNode>> {
     if (!recursive) {
-        return currentFolder.files
-            .asFlow()
-            .map { NodeWithPath(it as File, currentPath.mutable().add(it)) }
+        return currentFolder.files.asFlow()
     }
     return flow {
-        val stack = ArrayList<Pair<NodeWithPath<FolderNodeInterface>, Int>>()
-        stack.add(NodeWithPath(currentFolder, currentPath.mutable()) to 0)
+        val stack = ArrayList<Triple<FolderNode, FSPath, Int>>()
+        stack.add(Triple(currentFolder, currentPath, 0))
         while (stack.isNotEmpty()) {
-            val (folderNodeWithPath, index) = stack.removeLast()
-            val (folderNode, path) = folderNodeWithPath
+            val (folderNode, path, index) = stack.removeLast()
             if (index < folderNode.folders.size) {
-                stack.add(folderNodeWithPath to index + 1)
+                stack.add(Triple(folderNode, path, index + 1))
 
-                val nextNode = folderNode.folders[index]
-                stack.add(NodeWithPath(nextNode, path.copy().add(nextNode)) to 0)
-            } else {
-                folderNode.files.forEach {
-                    emit(NodeWithPath(it as File, path.copy().add(it)))
+                folderNode.folders[index].use { nextNode ->
+                    stack.add(Triple(nextNode.load(), nextNode.path, 0))
                 }
+            } else {
+                emitAll(folderNode.files.asFlow())
             }
         }
     }
 }
-
-fun <T> List<*>.toInits(): MutableList<() -> T> =
-    mapTo(mutableListOf()) { { throw IllegalStateException("Must be replaced!") } }
-
-fun ByteArray.toInt(): Int =
-    ByteBuffer.wrap(this).int
-
-fun ItemRecord.toMemoryArea(): MemoryArea =
-    MemoryArea(beginRecordPosition, recordSize)
 
 fun OutputStream.skip(size: Long) {
     val buffer = ByteArray(size.coerceAtMost(DEFAULT_BUFFER_SIZE.toLong()).toInt())
@@ -107,3 +98,27 @@ fun OutputStream.skip(size: Long) {
         remaining -= nextSize
     }
 }
+
+fun InputStream.readLong(): Long = readNBytes(LONG_SIZE).let { bytes ->
+    if (bytes.size != LONG_SIZE) {
+        throw ParseError("Failed to parse next long")
+    }
+    ByteBuffer.wrap(bytes).long
+}
+
+fun OutputStream.writeLong(long: Long) {
+    ByteBuffer
+        .allocate(LONG_SIZE)
+        .putLong(long)
+        .array()
+        .let { bytes -> write(bytes) }
+}
+
+fun ItemRecord.toPointer(): ItemPointer =
+    ItemPointer(beginRecordPosition)
+
+fun DataCellController.toMutableDataCell(): MutableDataCell =
+    MutableDataCell(this)
+
+fun DataCellController.toDataCell(): DataCell =
+    DataCell(this)

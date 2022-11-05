@@ -1,31 +1,37 @@
 package fs.interactor
 
-import fs.entity.DataCellController
-import fs.entity.MutableFileNode
-import fs.entity.MutableFolderNode
+import fs.entity.DataCell
+import fs.entity.FSPath
+import fs.entity.FileNode
+import fs.entity.FolderNode
+import fs.entity.MutableDataCell
+import fs.entity.NodeLoader
 
 /**
- * Interface for generating and save sequence of change events.
+ * Interface for working with file system.
  */
 interface InteractorInterface {
 
-    /**
-     * Creates root folder node.
-     */
-    fun getFileSystem(): MutableFolderNode
+    fun createFile(path: FSPath)
 
-    fun allocateNewData(minimalSize: Long): DataCellController
+    fun deleteFile(path: FSPath)
 
-    fun createFile(file: MutableFileNode)
+    fun moveFile(sourcePath: FSPath, destinationPath: FSPath)
 
-    fun deleteFile(file: MutableFileNode)
+    fun setMD5(path: FSPath, md5: ByteArray)
 
-    fun updateFileRecord(file: MutableFileNode)
+    fun getFileLoader(path: FSPath): NodeLoader<FileNode>
 
-    fun createFolder(folder: MutableFolderNode)
+    fun getDataCell(path: FSPath): DataCell
 
-    fun deleteFolder(folder: MutableFolderNode)
+    fun getMutableDataCell(path: FSPath): MutableDataCell
 
-    fun updateFolderRecord(folder: MutableFolderNode)
+    fun createFolder(path: FSPath)
+
+    fun deleteFolder(path: FSPath)
+
+    fun moveFolder(sourcePath: FSPath, destinationPath: FSPath)
+
+    fun getFolderLoader(path: FSPath): NodeLoader<FolderNode>
 
 }

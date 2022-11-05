@@ -3,9 +3,10 @@ package fs
 import capturing.impl.ReadPriorityCapture
 import fs.entity.DirectoryAlreadyExists
 import fs.entity.DirectoryNotFound
+import fs.entity.FSPath
+import fs.importer.SystemImporter
 import fs.interactor.FSInteractor
 import fs.interactor.InteractorInterface
-import fs.interactor.SimpleAllocator
 import java.io.RandomAccessFile
 import kotlin.io.path.Path
 import kotlin.io.path.div
@@ -23,8 +24,7 @@ class OneFileSystemProviderTest {
     private inline fun withTestFS(block: (InteractorInterface) -> Unit) {
         try {
             fsBuilder.build(fsPath)
-            val allocator = SimpleAllocator()
-            val interactor = FSInteractor(fsPath, allocator)
+            val interactor = FSInteractor(fsPath)
             block(interactor)
         } finally {
             fsPath.toFile().delete()
@@ -39,7 +39,7 @@ class OneFileSystemProviderTest {
 
             capture.captureRead {
                 withFolder {
-                    assertEquals("/", currentPath.path)
+                    assertEquals("/", currentPath.pathString)
                     assertEquals(2, currentFolder.files.size)
                     assertEquals(2, currentFolder.folders.size)
                 }
@@ -49,10 +49,10 @@ class OneFileSystemProviderTest {
                         assert(false)
                     } catch (_: DirectoryNotFound) {
                     }
-                    assertEquals("/", currentPath.path)
+                    assertEquals("/", currentPath.pathString)
 
                     cd("empty_folder")
-                    assertEquals("/empty_folder/", currentPath.path)
+                    assertEquals("/empty_folder/", currentPath.pathString)
                 }
                 withFolder {
                     assertEquals(0, currentFolder.files.size)
@@ -60,19 +60,19 @@ class OneFileSystemProviderTest {
                 }
                 withMutableFolder {
                     cd("/folder/empty_folder_2")
-                    assertEquals("/folder/empty_folder_2/", currentPath.path)
+                    assertEquals("/folder/empty_folder_2/", currentPath.pathString)
 
                     back()
-                    assertEquals("/folder/", currentPath.path)
+                    assertEquals("/folder/", currentPath.pathString)
 
                     cd("/empty_folder")
-                    assertEquals("/empty_folder/", currentPath.path)
+                    assertEquals("/empty_folder/", currentPath.pathString)
 
                     cd("/")
-                    assertEquals("/", currentPath.path)
+                    assertEquals("/", currentPath.pathString)
 
                     cd("folder/empty_folder_2/")
-                    assertEquals("/folder/empty_folder_2/", currentPath.path)
+                    assertEquals("/folder/empty_folder_2/", currentPath.pathString)
                 }
                 withFolder {
                     assertEquals(0, currentFolder.files.size)
@@ -80,7 +80,7 @@ class OneFileSystemProviderTest {
                 }
                 withMutableFolder {
                     back()
-                    assertEquals("/folder/", currentPath.path)
+                    assertEquals("/folder/", currentPath.pathString)
                 }
                 withFolder {
                     assertEquals(2, currentFolder.folders.size)
@@ -88,7 +88,7 @@ class OneFileSystemProviderTest {
                 }
                 withMutableFolder {
                     cd("folder_2")
-                    assertEquals("/folder/folder_2/", currentPath.path)
+                    assertEquals("/folder/folder_2/", currentPath.pathString)
                 }
                 withFolder {
                     assertEquals(1, currentFolder.files.size)
@@ -106,18 +106,18 @@ class OneFileSystemProviderTest {
 
             capture.captureRead {
                 withFolder {
-                    val foundFiles = findFiles("*").map { it.node.fileName }.toList().sorted()
+                    val foundFiles = findFiles("*").map { it.name }.toList().sorted()
                     val expectedFiles =
                         listOf("empty.txt", "file", "file_inner.txt", "strangeF!LE", "empty_file").sorted()
                     assertContentEquals(expectedFiles, foundFiles)
                 }
                 withFolder {
-                    val foundFiles = findFiles("**/*.txt").map { it.node.fileName }.toList().sorted()
+                    val foundFiles = findFiles("**/*.txt").map { it.name }.toList().sorted()
                     val expectedFiles = listOf("empty.txt", "file_inner.txt").sorted()
                     assertContentEquals(expectedFiles, foundFiles)
                 }
                 withFolder {
-                    val foundFiles = findFiles("*", recursive = false).map { it.node.fileName }.toList().sorted()
+                    val foundFiles = findFiles("*", recursive = false).map { it.name }.toList().sorted()
                     val expectedFiles = listOf("empty.txt", "file").sorted()
                     assertContentEquals(expectedFiles, foundFiles)
                 }
@@ -132,7 +132,7 @@ class OneFileSystemProviderTest {
                     back()
                 }
                 withFolder {
-                    val foundFiles = findFiles("**/folder*/*").map { it.path.path }.toList().sorted()
+                    val foundFiles = findFiles("**/folder*/*").map { it.path.pathString }.toList().sorted()
                     val expectedFiles = listOf(
                         "/folder/file_inner.txt", "/folder/strangeF!LE", "/folder/folder_2/empty_file"
                     ).sorted()
@@ -184,11 +184,11 @@ class OneFileSystemProviderTest {
                     createFolder("new_folder")
                     assertEquals(3, currentFolder.folders.size)
                     cd("new_folder")
-                    assertEquals("/new_folder/", currentPath.path)
+                    assertEquals("/new_folder/", currentPath.pathString)
                 }
             }
 
-            val fileSystem = interactor.getFileSystem()
+            val fileSystem = interactor.getFolderLoader(FSPath("/")).load()
             assertEquals(3, fileSystem.folders.size)
             assertEquals(3, fileSystem.files.size)
         }
@@ -205,7 +205,6 @@ class OneFileSystemProviderTest {
                     deleteFile("empty.txt")
                 }
                 withFolder {
-                    println(findFiles("**/empty.txt", recursive = false).toList().map { it.path.path })
                     assert(findFiles("**/empty.txt", recursive = false).toList().isEmpty())
                 }
                 withMutableFolder {
@@ -220,7 +219,7 @@ class OneFileSystemProviderTest {
                 }
             }
 
-            val fileSystem = interactor.getFileSystem()
+            val fileSystem = interactor.getFolderLoader(FSPath("/")).load()
             assertEquals(1, fileSystem.folders.size)
             assertEquals(1, fileSystem.files.size)
         }
@@ -269,11 +268,11 @@ class OneFileSystemProviderTest {
                 }
             }
 
-            val fileSystem = interactor.getFileSystem()
+            val fileSystem = interactor.getFolderLoader(FSPath("/")).load()
             assertEquals(1, fileSystem.files.size)
             assertEquals(2, fileSystem.folders.size)
-            assertEquals(0, fileSystem.folders.first { it.folderName == "empty_folder_2" }.files.size)
-            assertEquals(2, fileSystem.folders.first { it.folderName == "renamed_folder" }.folders.size)
+            assertEquals(0, fileSystem.folders.first { it.name == "empty_folder_2" }.load().files.size)
+            assertEquals(2, fileSystem.folders.first { it.name == "renamed_folder" }.load().folders.size)
         }
     }
 
@@ -322,11 +321,11 @@ class OneFileSystemProviderTest {
                 }
             }
 
-            val fileSystem = interactor.getFileSystem()
+            val fileSystem = interactor.getFolderLoader(FSPath("/")).load()
             assertEquals(3, fileSystem.files.size)
             assertEquals(2, fileSystem.folders.size)
-            assertEquals(0, fileSystem.folders.first { it.folderName == "empty_folder" }.files.size)
-            assertEquals(3, fileSystem.folders.first { it.folderName == "folder" }.folders.size)
+            assertEquals(0, fileSystem.folders.first { it.name == "empty_folder" }.load().files.size)
+            assertEquals(3, fileSystem.folders.first { it.name == "folder" }.load().folders.size)
         }
     }
 
@@ -369,19 +368,22 @@ class OneFileSystemProviderTest {
                 }
             }
 
-            val fileSystem = interactor.getFileSystem()
             val raf = RandomAccessFile(fsPath.toFile(), "r")
 
-            fileSystem.files.forEach {
-                val pointer = it.dataCell.controller.dataPointer
+            interactor.getDataCell(FSPath("/file")).use { dataCell ->
+                val pointer = dataCell.controller.dataPointer
                 raf.seek(pointer.beginPosition)
                 val content = ByteArray(pointer.dataLength.toInt())
                 raf.readFully(content)
-                if (it.fileName == "file") {
-                    assertEquals("This is FILE.", content.decodeToString())
-                } else if (it.fileName == "empty.txt") {
-                    assertEquals("Some text", content.decodeToString())
-                }
+                assertEquals("This is FILE.", content.decodeToString())
+            }
+
+            interactor.getDataCell(FSPath("/empty.txt")).use { dataCell ->
+                val pointer = dataCell.controller.dataPointer
+                raf.seek(pointer.beginPosition)
+                val content = ByteArray(pointer.dataLength.toInt())
+                raf.readFully(content)
+                assertEquals("Some text", content.decodeToString())
             }
 
             raf.close()
@@ -419,10 +421,10 @@ class OneFileSystemProviderTest {
                 }
             }
 
-            val fileSystem = interactor.getFileSystem()
+            val fileSystem = interactor.getFolderLoader(FSPath("/")).load()
             assertEquals(3, fileSystem.files.size)
             assertEquals(3, fileSystem.folders.size)
-            assertEquals(1, fileSystem.folders.first { it.folderName == "testDir" }.files.size)
+            assertEquals(1, fileSystem.folders.first { it.name == "testDir" }.load().files.size)
 
         }
     }

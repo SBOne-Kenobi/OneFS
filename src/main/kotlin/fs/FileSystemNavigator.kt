@@ -7,85 +7,72 @@ import capturing.WriteContext
 import capturing.impl.ReadPriorityCapture
 import fs.entity.DirectoryNotFound
 import fs.entity.FSPath
-import fs.entity.FSPathInterface
 import fs.entity.FileNode
-import fs.entity.FileNodeInterface
 import fs.entity.FileNotFound
 import fs.entity.FolderNode
-import fs.entity.FolderNodeInterface
-import fs.entity.MutableFSPath
-import fs.entity.MutableFileNode
-import fs.entity.MutableFolderNode
-import fs.entity.add
-import fs.entity.immutable
-import fs.entity.immutableFolder
-import fs.entity.mutable
-import fs.entity.path
-import fs.entity.removeLast
+import fs.entity.NodeLoader
+import fs.interactor.InteractorInterface
 
 /**
  * Helper class for navigation in file system.
  */
-class FileSystemNavigator(val _rootNode: MutableFolderNode) :
-    ContextProvider<NavReadContext, NavWriteContext>, WithNavigator
-{
+class FileSystemNavigator(private val interactor: InteractorInterface) :
+    ContextProvider<NavReadContext, NavWriteContext>, WithNavigator, AutoCloseable {
     private val capture = ReadPriorityCapture(this)
 
-    private var _currentFolderNode: MutableFolderNode = _rootNode
-    private var _currentPath = _currentFolderNode.path.mutable()
+    private var _currentLoader: NodeLoader<FolderNode> = interactor.getFolderLoader(FSPath("/"))
+        set(value) {
+            field.close()
+            _currentPath = value.path
+            _currentFolderNode = value.load()
+            field = value
+        }
+    private var _currentFolderNode: FolderNode
+    private var _currentPath: FSPath
+
+    init {
+        _currentPath = _currentLoader.path
+        _currentFolderNode = _currentLoader.load()
+    }
 
     override suspend fun createReadContext(): NavReadContext =
         object : NavReadContext {
-            override val rootFolder: FolderNode by lazy {
-                _rootNode.immutableFolder()
-            }
-            override val currentFolder: FolderNode by lazy {
-                _currentFolderNode.immutableFolder()
-            }
-            override val currentPath: FSPathInterface by lazy {
-                _currentPath.immutable()
-            }
+            override val currentLoader: NodeLoader<FolderNode> by ::_currentLoader
+            override val currentFolder: FolderNode by ::_currentFolderNode
+            override val currentPath: FSPath by ::_currentPath
         }
 
     override suspend fun createWriteContext(): NavWriteContext {
         return object : NavWriteContext {
-            override val rootFolder: MutableFolderNode by ::_rootNode
-            override val currentFolder: MutableFolderNode by ::_currentFolderNode
-            override val currentPath: FSPathInterface by ::_currentPath
+            override var currentLoader: NodeLoader<FolderNode> by ::_currentLoader
+            override val currentFolder: FolderNode by ::_currentFolderNode
+            override val currentPath: FSPath by ::_currentPath
 
             override infix fun cd(targetPath: String) {
-                var newFolderNode: MutableFolderNode
-                val newPath: MutableFSPath
-
-                val targetPathOptimized = targetPath.removePrefix(currentPath.path)
-                if (targetPathOptimized.isBlank()) {
-                    return
-                }
-
-                val target = FSPath(targetPathOptimized)
-                if (targetPathOptimized.startsWith('/')) {
-                    newFolderNode = _rootNode
-                    newPath = MutableFSPath()
+                if (targetPath.startsWith('/')) {
+                    val path = if (targetPath.endsWith('/')) {
+                        targetPath
+                    } else {
+                        "$targetPath/"
+                    }
+                    currentLoader = interactor.getFolderLoader(FSPath(path))
                 } else {
-                    newFolderNode = _currentFolderNode
-                    newPath = _currentPath
-                }
+                    val path = FSPath(targetPath)
 
-                target.pathList.forEach { nextName ->
-                    newFolderNode = newFolderNode.folders
-                        .firstOrNull { it.folderName == nextName }
-                        ?: throw DirectoryNotFound(newPath.path + nextName)
-                    newPath.add(newFolderNode)
+                    path.pathList.forEach { name ->
+                        currentLoader = getFolder(name)
+                    }
                 }
-                _currentFolderNode = newFolderNode
-                _currentPath = newPath
             }
 
             override fun back() {
-                _currentFolderNode.parent?.let {
-                    _currentFolderNode = it
-                    _currentPath.removeLast()
+                currentFolder.parent?.let {
+                    currentLoader = it
                 }
+            }
+
+            override fun reload() {
+                _currentLoader = _currentLoader
             }
         }
     }
@@ -106,43 +93,35 @@ class FileSystemNavigator(val _rootNode: MutableFolderNode) :
         return capture.tryCaptureRead(block)
     }
 
+    override fun close() {
+        _currentLoader.close()
+    }
+
 }
 
-typealias NavContextGeneric = NavContext<FileNodeInterface, FolderNodeInterface>
+interface NavContext {
+    val currentLoader: NodeLoader<FolderNode>
+    val currentFolder: FolderNode
+    val currentPath: FSPath
 
-interface NavContext<out File: FileNodeInterface, out Folder: FolderNodeInterface> {
-    val rootFolder: Folder
-    val currentFolder: Folder
-    val currentPath: FSPathInterface
+    /**
+     * Get folder with [name].
+     */
+    fun getFolder(name: String): NodeLoader<FolderNode> = currentFolder.folders
+        .firstOrNull { it.name == name }
+        ?: throw DirectoryNotFound(currentPath.pathString + name)
+
+    /**
+     * Get file with [name].
+     */
+    fun getFile(name: String): NodeLoader<FileNode> = currentFolder.files
+        .firstOrNull { it.name == name }
+        ?: throw FileNotFound(currentPath.pathString + name)
 }
 
-/**
- * Get folder with [name].
- */
-inline fun <File: FileNodeInterface, reified Folder: FolderNodeInterface> NavContext<File, Folder>.getFolder(
-    name: String
-): Folder = currentFolder.folders
-    .firstOrNull { it.folderName == name } as Folder?
-    ?: throw DirectoryNotFound(currentPath.path + name)
+interface NavReadContext : ReadContext, NavContext
 
-/**
- * Get file with [name].
- */
-inline fun <reified File: FileNodeInterface, Folder: FolderNodeInterface> NavContext<File, Folder>.getFile(
-    name: String
-): File = currentFolder.files
-    .firstOrNull { it.fileName == name } as File?
-    ?: throw FileNotFound(currentPath.path + name)
-
-interface NavReadContext : ReadContext, NavContext<FileNode, FolderNode> {
-    override val rootFolder: FolderNode
-    override val currentFolder: FolderNode
-}
-
-interface NavWriteContext : WriteContext, NavContext<MutableFileNode, MutableFolderNode> {
-    override val rootFolder: MutableFolderNode
-    override val currentFolder: MutableFolderNode
-
+interface NavWriteContext : WriteContext, NavContext {
     /**
      * Go to path [targetPath].
      */
@@ -152,12 +131,17 @@ interface NavWriteContext : WriteContext, NavContext<MutableFileNode, MutableFol
      * Go to the parent directory.
      */
     fun back()
+
+    /**
+     * Load changes from file system.
+     */
+    fun reload()
 }
 
 /**
  * Wraps capturing with clear names for navigation.
  */
-interface WithNavigator: AccessCapture<NavReadContext, NavWriteContext> {
+interface WithNavigator : AccessCapture<NavReadContext, NavWriteContext> {
     /**
      * Alias for [captureWrite].
      */

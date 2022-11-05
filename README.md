@@ -7,19 +7,16 @@ This project is a FileSystem that stores all information about self in one file.
 - There are some default strategies described in package `capturing.impl`, but also there is possibility of creation your own strategies. 
 - Storage format of FileSystem is described in `fs/entity/FSFormat.kt`.
 - Storage format is sequence of files and folders records with pointers to each other.
-- There are pointers to content of file.
 - Created interface `InteractorInterface` for working with records and overrides them.
-- Supported strategies of allocation of datas.
 
 ### Future improvement
 - Provide easy-to-use interface for working with OneFileSystem.
-- Provide better allocation strategies.
+- Speed up working with FS
 
 ## Usage
 Create OneFileSystem provider and choose strategy for working with FS.
 ```kotlin 
-val allocator = SimpleAllocator()
-val interactor = FSInteractor(fileSystemPath, allocator)
+val interactor = FSInteractor(fileSystemPath)
 val provider = OneFileSystemProvider(interactor)
 val capture = ReadPriorityCapture(provider)
 ```

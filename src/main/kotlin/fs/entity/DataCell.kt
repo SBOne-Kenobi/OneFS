@@ -33,18 +33,25 @@ interface DataCellController : AutoCloseable {
 
     fun allocateNew(newMinimalSize: Long): DataCellController
     fun free()
-
-    fun createDeepCopy(): DataCellController
 }
 
-interface DataCellInterface {
+interface DataCellInterface: AutoCloseable {
     fun getInputStream(): InputStream
 }
 
-class DataCell(private val controller: DataCellController) : DataCellInterface {
+class DataCell(val controller: DataCellController) : DataCellInterface {
     override fun getInputStream(): InputStream {
         val length = controller.dataPointer.dataLength
-        return BoundedInputStream(controller.getInputStream(), length)
+        return object : BoundedInputStream(controller.getInputStream(), length), AutoCloseable {
+            override fun close() {
+                super.close()
+                this@DataCell.close()
+            }
+        }
+    }
+
+    override fun close() {
+        controller.close()
     }
 }
 
@@ -54,7 +61,16 @@ class MutableDataCell(controller: DataCellController) : DataCellInterface {
 
     override fun getInputStream(): InputStream {
         val length = controller.dataPointer.dataLength
-        return BoundedInputStream(controller.getInputStream(), length)
+        return object : BoundedInputStream(controller.getInputStream(), length), AutoCloseable {
+            override fun close() {
+                super.close()
+                this@MutableDataCell.close()
+            }
+        }
+    }
+
+    override fun close() {
+        controller.close()
     }
 
     fun clearData() {
@@ -108,6 +124,7 @@ class MutableDataCell(controller: DataCellController) : DataCellInterface {
             override fun close() {
                 super.close()
                 baseOutputStream.close()
+                this@MutableDataCell.close()
             }
 
             override fun flush() {

@@ -1,9 +1,10 @@
 package fs.entity
 
+import fs.readLong
 import fs.skip
+import fs.writeLong
 import java.io.InputStream
 import java.io.OutputStream
-import java.nio.ByteBuffer
 
 /*
     Global item format: [type, 1 byte] [size of data, 8 bytes] [data, any bytes].
@@ -11,7 +12,7 @@ import java.nio.ByteBuffer
     Free record:        type=0, data=[some data].
     Row used content:   type=1, data=[filled size, 8 bytes] [capacity size, 8 bytes] [content].
     File:               type=2, data=[name, 30 bytes] [IP to parent] [IP to content] [creationTimestamp, 8 bytes] [modificationTimestamp, 8 bytes] [md5, 16 bytes].
-    Folder:             type=3, data=[name, 30 bytes] [IP to parent].
+    Folder:             type=3, data=[name, 30 bytes] [IP to parent] [IP to children list].
 
     Null IP = -1
 */
@@ -71,6 +72,7 @@ class FileRecord(
 class FolderRecord(
     val name: String,
     val parentPointer: ItemPointer,
+    val childrenPointer: ItemPointer,
     beginRecordPosition: Long
 ) : ItemRecord(
     type = 3,
@@ -78,18 +80,11 @@ class FolderRecord(
     beginRecordPosition = beginRecordPosition
 ) {
     companion object {
-        const val DATA_SIZE = MAX_NAME_SIZE + ITEM_POINTER_SIZE
+        const val DATA_SIZE = MAX_NAME_SIZE + ITEM_POINTER_SIZE + ITEM_POINTER_SIZE
     }
 }
 
 class ParseError(message: String? = null, cause: Throwable? = null) : Exception(message, cause)
-
-private fun InputStream.readLong(): Long = readNBytes(LONG_SIZE).let { bytes ->
-    if (bytes.size != LONG_SIZE) {
-        throw ParseError("Failed to parse next long")
-    }
-    ByteBuffer.wrap(bytes).long
-}
 
 fun parseFreeData(inputStream: InputStream, sizeOfData: Long, position: Long) : FreeRecord {
     val skipped = inputStream.skip(sizeOfData)
@@ -152,8 +147,9 @@ fun parseFolderData(inputStream: InputStream, sizeOfData: Long, position: Long) 
 
     val name = inputStream.parseName()
     val parentPointer = inputStream.parseItemPointer()
+    val childrenPointer = inputStream.parseItemPointer()
 
-    return FolderRecord(name, parentPointer, position)
+    return FolderRecord(name, parentPointer, childrenPointer, position)
 }
 
 fun parseNextRecord(inputStream: InputStream, position: Long): ItemRecord? {
@@ -175,15 +171,16 @@ fun parseNextRecord(inputStream: InputStream, position: Long): ItemRecord? {
     }
 }
 
-class WriteError(message: String? = null, cause: Throwable? = null) : Exception(message, cause)
-
-private fun OutputStream.writeLong(long: Long) {
-    ByteBuffer
-        .allocate(LONG_SIZE)
-        .putLong(long)
-        .array()
-        .let { bytes -> write(bytes) }
+fun InputStream.getRecords(): Sequence<ItemRecord> = sequence {
+    var position = 0L
+    while (true) {
+        val record = parseNextRecord(this@getRecords, position) ?: break
+        position += record.recordSize
+        yield(record)
+    }
 }
+
+class WriteError(message: String? = null, cause: Throwable? = null) : Exception(message, cause)
 
 fun OutputStream.writeFreeData(record: FreeRecord) {
     skip(record.sizeOfData)
@@ -221,6 +218,7 @@ fun OutputStream.writeFileData(record: FileRecord) {
 fun OutputStream.writeFolderData(record: FolderRecord) {
     writeName(record.name)
     writeItemPointer(record.parentPointer)
+    writeItemPointer(record.childrenPointer)
 }
 
 fun writeRecord(outputStream: OutputStream, record: ItemRecord, inputStream: InputStream? = null) {
@@ -238,5 +236,3 @@ fun writeRecord(outputStream: OutputStream, record: ItemRecord, inputStream: Inp
         throw WriteError("Failed to write record", e)
     }
 }
-
-
